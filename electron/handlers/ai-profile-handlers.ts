@@ -49,9 +49,17 @@ export interface AiProfileHandlerDependencies {
 }
 
 const MODELS_RESPONSE_LIMIT_BYTES = 2 * 1024 * 1024;
-/** 自动刷新节流：同一来源在该窗口内只尝试一次 /models，手动 force 除外。 */
+/** 自动刷新节流：手动刷新仍会发出查询。 */
 const MODELS_REFRESH_TTL_MS = 10 * 60 * 1000;
-const lastModelsRefreshAt = new Map<string, number>();
+// 清单只记录型号。单独的存储键保留各实际协议的探测和手动设置。
+const MODEL_DIRECTORY_SURFACE = "model-directory";
+
+function apigotoCatalogUrl(baseUrl: string) {
+  const url = new URL(baseUrl);
+  if (url.protocol === "https:" && ["api.apigoto.com", "www.apigoto.com", "apigoto.com"].includes(url.host))
+    return `${url.origin}/api/v1/user/user/models`;
+  return null;
+}
 
 function profileError(error: unknown) {
   return error instanceof Error ? error.message : String(error);
@@ -221,6 +229,7 @@ export function registerAiProfileHandlers({
   now,
   health,
 }: AiProfileHandlerDependencies): void {
+  const modelRefreshes = new Map<string, { startedAt: number; models: string[] }>();
   const credentialIds = new Set<string>();
   const refreshCredentialIds = async () => {
     credentialIds.clear();
@@ -245,7 +254,7 @@ export function registerAiProfileHandlers({
     }
     if (database.getDefaultAiProfileId() === null) database.setDefaultAiProfileId(saved.id);
     // 保存可能补上了密钥或换了端点，允许立刻重新拉一次清单。
-    lastModelsRefreshAt.delete(saved.id);
+    modelRefreshes.delete(saved.id);
     return view(saved);
   });
 
@@ -257,7 +266,7 @@ export function registerAiProfileHandlers({
       log("warn", "ai.profile.credential_delete_failed", { id, error: profileError(error) });
     });
     credentialIds.delete(id);
-    lastModelsRefreshAt.delete(id);
+    modelRefreshes.delete(id);
   });
 
   register("setDefaultAiProfile", (id) => {
@@ -306,7 +315,7 @@ export function registerAiProfileHandlers({
       lastError: result.ok ? null : result.message.slice(0, 300),
     });
     // 连接刚验证成功，清单可以立刻重拉。
-    if (result.ok) lastModelsRefreshAt.delete(id);
+    if (result.ok) modelRefreshes.delete(id);
     return { ok: result.ok, message: result.message };
   });
 
@@ -319,61 +328,78 @@ export function registerAiProfileHandlers({
   register("refreshAiProfileModels", async (id, force) => {
     const profile = database.getAiProfile(id);
     if (!profile) throw new Error("来源不存在");
-    if (profile.apiSurface === "anthropic-messages") return [];
-    const lastAttemptAt = lastModelsRefreshAt.get(id) ?? 0;
-    if (!force && Date.now() - lastAttemptAt < MODELS_REFRESH_TTL_MS) {
-      return database
-        .listModelCapabilities(id)
-        .filter((record) => record.source === "remote")
-        .map((record) => record.modelId);
-    }
-    lastModelsRefreshAt.set(id, Date.now());
-    const secret = profile.authScheme === "none" ? "" : await credentials.read(id);
-    const url = withQuery(`${profile.baseUrl}/models`, profile.extraQuery);
+    const catalogUrl = apigotoCatalogUrl(profile.baseUrl);
+    if (!catalogUrl && profile.apiSurface === "anthropic-messages") return [];
+    const previous = modelRefreshes.get(id);
+    if (previous && !force && Date.now() - previous.startedAt < MODELS_REFRESH_TTL_MS) return previous.models;
+    const refresh = { startedAt: Date.now(), models: previous?.models ?? [] };
+    modelRefreshes.set(id, refresh);
+
+    const secret = catalogUrl || profile.authScheme === "none" ? "" : await credentials.read(id);
+    const url = catalogUrl ?? withQuery(`${profile.baseUrl}/models`, profile.extraQuery);
     const requestInit: RequestInit = {
       method: "GET",
       headers: {
         Accept: "application/json",
         ...(secret ? authHeadersFor(profile, secret) : {}),
-        ...profile.extraHeaders,
+        ...(catalogUrl ? {} : profile.extraHeaders),
       },
       signal: AbortSignal.timeout(20_000),
     };
-    const response = profile.localEndpoint
-      ? await fetchLocalEndpointResponse(url, requestInit)
-      : await fetchPublicHttpResponse(url, requestInit);
-    if (response.status === 404 || response.status === 405) return [];
+    const response =
+      !catalogUrl && profile.localEndpoint
+        ? await fetchLocalEndpointResponse(url, requestInit)
+        : await fetchPublicHttpResponse(url, requestInit);
+    if (response.status === 404 || response.status === 405) {
+      refresh.models = [];
+      return [];
+    }
     if (!response.ok) throw new Error(`获取模型清单失败：HTTP ${response.status}`);
     const text = (await response.text()).slice(0, MODELS_RESPONSE_LIMIT_BYTES);
-    let parsed: unknown;
+    type ModelRow = { id?: unknown; model_id?: unknown; status?: string; client_visible?: boolean };
+    let parsed: { code?: unknown; data?: unknown } | null;
     try {
       parsed = JSON.parse(text);
     } catch {
       throw new Error("模型清单不是合法 JSON");
     }
-    const data = (parsed as { data?: unknown }).data;
-    if (!Array.isArray(data)) return [];
-    const models = data
-      .map((item) => (item as { id?: unknown }).id)
-      .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
-      .slice(0, 500);
+    if (catalogUrl && parsed?.code !== 0) throw new Error("APIGoto 公开目录查询失败");
+    const data = parsed?.data;
+    if (!Array.isArray(data)) {
+      refresh.models = [];
+      return [];
+    }
+    const models = [
+      ...new Set(
+        (data as Array<ModelRow | null>)
+          .map((item) => {
+            if (!catalogUrl) return item?.id;
+            return item?.status === "enabled" && item.client_visible === true ? item.model_id : undefined;
+          })
+          .filter((value): value is string => typeof value === "string")
+          .map((value) => value.trim())
+          .filter((value) => value.length > 0 && value.length <= 200),
+      ),
+    ].slice(0, 500);
+    if (modelRefreshes.get(id) !== refresh) throw new Error("来源已更新，请重新查询模型清单");
+    const fetchedAt = now();
     for (const modelId of models) {
-      const apiSurface = profile.apiSurface === "auto" ? "openai-chat" : profile.apiSurface;
       database.saveModelCapability({
         profileId: profile.id,
         modelId,
-        apiSurface,
+        apiSurface: MODEL_DIRECTORY_SURFACE,
         supportsJsonSchema: null,
         supportsJsonMode: null,
         supportsStreaming: null,
         supportsStreamUsage: null,
         supportsReasoning: null,
         maxOutputTokens: null,
-        contextWindow: preservedContextWindow(database, profile.id, modelId, apiSurface),
-        probedAt: now(),
-        source: "remote",
+        contextWindow: null,
+        probedAt: fetchedAt,
+        source: catalogUrl ? "provider-catalog" : "remote",
       });
     }
+    refresh.models = models;
     return models;
   });
 

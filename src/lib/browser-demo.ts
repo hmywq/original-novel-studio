@@ -13,6 +13,7 @@ import type {
   ProjectSummary,
   RankingSnapshot,
   ResearchBook,
+  ResearchSelection,
 } from "../shared/types";
 
 export interface DemoState {
@@ -20,6 +21,7 @@ export interface DemoState {
   planVersions: Record<string, number>;
   rankings: RankingSnapshot[];
   books: ResearchBook[];
+  researchSelections: ResearchSelection[];
   insights: InsightPack[];
   settings: AiSettings;
   directorNotes: Record<string, string[]>;
@@ -323,6 +325,7 @@ export function seed(): DemoState {
         ],
       },
     ],
+    researchSelections: [],
     books: [
       {
         id: "demo-book",

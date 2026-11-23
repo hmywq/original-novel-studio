@@ -1,9 +1,11 @@
 import {
   BookCopy,
   BookOpen,
+  Brain,
   Database,
   Download,
   LayoutDashboard,
+  LibraryBig,
   Plus,
   Search,
   Settings,
@@ -20,6 +22,10 @@ import { NavigationGuardProvider, useNavigationGuard } from "./lib/navigation-gu
 import { DashboardPage } from "./pages/DashboardPage";
 
 const ResearchPage = lazy(() => import("./pages/ResearchPage").then((m) => ({ default: m.ResearchPage })));
+const IdeaWorkshopPage = lazy(() => import("./pages/IdeaWorkshopPage").then((m) => ({ default: m.IdeaWorkshopPage })));
+const TemplateLibraryPage = lazy(() =>
+  import("./pages/TemplateLibraryPage").then((m) => ({ default: m.TemplateLibraryPage })),
+);
 const IncubationWorkspace = lazy(() =>
   import("./pages/IncubationWorkspace").then((m) => ({ default: m.IncubationWorkspace })),
 );
@@ -27,9 +33,10 @@ const SettingsPage = lazy(() => import("./pages/SettingsPage").then((m) => ({ de
 const ProjectPage = lazy(() => import("./pages/ProjectPage").then((m) => ({ default: m.ProjectPage })));
 
 import { describeError } from "./lib/error-message";
+import type { IdeaStarter } from "./shared/idea-workbench";
 import type { DashboardData, IncubationDraft, ProjectSummary, UpdateStatus } from "./shared/types";
 
-type AppPage = "dashboard" | "research" | "incubation" | "project" | "settings";
+type AppPage = "dashboard" | "ideas" | "research" | "templates" | "incubation" | "project" | "settings";
 
 export default function App() {
   return (
@@ -47,7 +54,9 @@ function Workbench() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [createModal, setCreateModal] = useState<{ draft: IncubationDraft | null } | null>(null);
+  const [templateQuery, setTemplateQuery] = useState("");
   const [incubations, setIncubations] = useState<IncubationDraft[]>([]);
+  const [ideaStarter, setIdeaStarter] = useState<{ key: string; starter: IdeaStarter } | null>(null);
   const [deleteProject, setDeleteProject] = useState<ProjectSummary | null>(null);
   const [deleteConfirmation, setDeleteConfirmation] = useState("");
   const [deleteBusy, setDeleteBusy] = useState(false);
@@ -67,7 +76,7 @@ function Workbench() {
     setDashboard(nextDashboard);
     setProjects(nextProjects);
     setHasApiKey(settings?.hasApiKey ?? null);
-    setIncubations(nextIncubations.filter((draft) => draft.status === "孵化中"));
+    setIncubations(nextIncubations);
   }, [api]);
   useEffect(() => {
     void reload();
@@ -105,6 +114,13 @@ function Workbench() {
     void reload();
   };
   const visibleProjects = projects.filter((project) => project.title.toLowerCase().includes(search.toLowerCase()));
+  const workingDrafts = incubations.filter(
+    (draft) => draft.status === "孵化中" && (!draft.idea || draft.candidates.length),
+  );
+  const openIdea = (starter: IdeaStarter) => {
+    setIdeaStarter({ key: crypto.randomUUID(), starter });
+    navigate("ideas");
+  };
 
   return (
     <div className="app-shell">
@@ -114,11 +130,22 @@ function Workbench() {
             <BookOpen size={20} />
           </span>
           <div>
-            <strong>长篇创作</strong>
-            <small>Novel Studio</small>
+            <strong>原创小说</strong>
+            <small>个人工作台</small>
           </div>
         </div>
         <nav className="main-nav">
+          <button
+            type="button"
+            className={page === "ideas" ? "active" : ""}
+            onClick={() => {
+              setIdeaStarter(null);
+              navigate("ideas");
+            }}
+          >
+            <Brain size={18} />
+            脑洞库
+          </button>
           <button type="button" className={page === "dashboard" ? "active" : ""} onClick={() => navigate("dashboard")}>
             <LayoutDashboard size={18} />
             多书总览
@@ -129,12 +156,23 @@ function Workbench() {
           </button>
           <button
             type="button"
+            className={page === "templates" ? "active" : ""}
+            onClick={() => {
+              setTemplateQuery("");
+              navigate("templates");
+            }}
+          >
+            <LibraryBig size={18} />
+            模板库
+          </button>
+          <button
+            type="button"
             className={page === "incubation" ? "active" : ""}
             onClick={() => navigate("incubation")}
           >
             <Sparkles size={18} />
             立项台
-            {incubations.length > 0 && <span className="nav-count">{incubations.length}</span>}
+            {workingDrafts.length > 0 && <span className="nav-count">{workingDrafts.length}</span>}
           </button>
         </nav>
         <div className="sidebar-projects">
@@ -191,7 +229,7 @@ function Workbench() {
             <DashboardPage
               data={dashboard}
               hasApiKey={hasApiKey}
-              incubations={incubations}
+              incubations={workingDrafts}
               onCreate={() => setCreateModal({ draft: null })}
               onResumeIncubation={(draft) => setCreateModal({ draft })}
               onOpenProject={openProject}
@@ -202,11 +240,47 @@ function Workbench() {
               }}
             />
           )}
-          {page === "research" && <ResearchPage api={api} notify={notify} />}
+          {page === "ideas" && (
+            <IdeaWorkshopPage
+              key={ideaStarter?.key}
+              api={api}
+              drafts={incubations}
+              initialStarter={ideaStarter?.starter}
+              reload={reload}
+              notify={notify}
+              onDevelop={(draft) => setCreateModal({ draft })}
+              onOpenProject={openProject}
+            />
+          )}
+          {page === "research" && (
+            <ResearchPage
+              api={api}
+              notify={notify}
+              onIdea={openIdea}
+              onTemplates={(query) => {
+                setTemplateQuery(query);
+                navigate("templates");
+              }}
+            />
+          )}
+          {page === "templates" && (
+            <TemplateLibraryPage
+              key={templateQuery}
+              api={api}
+              initialQuery={templateQuery}
+              notify={notify}
+              onVariants={(draft) => setCreateModal({ draft })}
+              onCreated={(project) => {
+                openProject(project.id);
+                void reload();
+                notify("作品已创建，开篇细纲与长线规划待确认");
+              }}
+            />
+          )}
           {page === "incubation" && (
             <IncubationWorkspace
               api={api}
-              drafts={incubations}
+              drafts={workingDrafts}
               reload={reload}
               notify={notify}
               onEdit={(draft) => setCreateModal({ draft })}
@@ -233,7 +307,10 @@ function Workbench() {
         <NewProjectModal
           api={api}
           initialDraft={createModal.draft}
-          onClose={() => setCreateModal(null)}
+          onClose={() => {
+            setCreateModal(null);
+            void reload();
+          }}
           notify={notify}
           onCreated={async (created) => {
             setCreateModal(null);

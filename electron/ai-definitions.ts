@@ -350,6 +350,16 @@ export const QualityReviewSchema = z.object({
         category: z.string().min(1).max(40),
         message: z.string().min(1).max(500),
         evidence: z.string().max(500),
+        continuityConflictConfirmed: z.boolean().default(false),
+        continuityEvidence: z
+          .object({
+            sourceId: z.string().min(1).max(200),
+            previousQuote: z.string().min(4).max(500),
+            currentQuote: z.string().min(4).max(500),
+            conflictKind: z.enum(["身份", "日期", "状态", "动作", "视角"]),
+          })
+          .nullable()
+          .default(null),
       }),
     )
     .max(8),

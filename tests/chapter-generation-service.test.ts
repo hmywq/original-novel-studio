@@ -3,11 +3,13 @@ import { createChapterGenerationGuard } from "../electron/ai-retry";
 import {
   type ChapterGenerationAi,
   type ChapterGenerationDatabase,
+  type ChapterGenerationDependencies,
   createChapterGenerationCoordinator,
 } from "../electron/chapter-generation-service";
 import type {
   AiSettings,
   Chapter,
+  CheckedChapterQualityReview,
   ContextPackage,
   LedgerFact,
   ProjectDetail,
@@ -143,7 +145,10 @@ function createHarness(options: { project?: ProjectDetail; apiKey?: string; star
   const getProject = vi.fn(() => project);
   const getAiSettings = vi.fn(() => settings);
   const searchRelevantFacts = vi.fn(() => relevantFacts);
-  const saveGeneratedChapter = vi.fn((_projectId: string, chapter: Chapter) => chapter);
+  const saveGeneratedChapter = vi.fn((_projectId: string, chapter: Chapter) => {
+    project.chapters = project.chapters.map((current) => (current.id === chapter.id ? chapter : current));
+    return chapter;
+  });
   const markAiJobApplicationFailed = vi.fn();
   const startDraftChapter = vi.fn((_projectId: string, _chapter: Chapter) => ({
     jobId: "job-1",
@@ -169,6 +174,36 @@ function createHarness(options: { project?: ProjectDetail; apiKey?: string; star
     },
   );
   const compileContext = vi.fn(() => context);
+  const qualityReview = (chapterId: string): CheckedChapterQualityReview => ({
+    issues: [],
+    observations: [],
+    check: {
+      runId: `review-${chapterId}`,
+      status: "已通过",
+      chapterFingerprint: "content",
+      inputFingerprint: "input",
+      checkedAt: timestamp,
+      issueIds: [],
+      observations: [],
+      reason: null,
+    },
+  });
+  const quality = {
+    run: vi.fn(async (_projectId: string, chapterId: string, _options: unknown) => {
+      const review = qualityReview(chapterId);
+      const current = project.chapters.find((entry) => entry.id === chapterId);
+      if (current) current.qualityCheck = review.check;
+      return review;
+    }),
+    reusable: vi.fn((_projectId: string, chapterId: string, _override?: unknown): CheckedChapterQualityReview | null =>
+      project.chapters.find((entry) => entry.id === chapterId)?.qualityCheck ? qualityReview(chapterId) : null,
+    ),
+  };
+  const estimateReview = vi.fn(() => ({
+    inputTokens: 500,
+    outputTokens: 2_000,
+    pricing: { inputPerMillion: 1, outputPerMillion: 2 },
+  }));
   const database: ChapterGenerationDatabase = {
     getProject,
     getAiSettings,
@@ -185,6 +220,8 @@ function createHarness(options: { project?: ProjectDetail; apiKey?: string; star
     ai,
     hasAiCredential: () => Boolean(apiKey),
     compileContext,
+    quality,
+    estimateReview,
   });
   return {
     coordinator,
@@ -198,6 +235,9 @@ function createHarness(options: { project?: ProjectDetail; apiKey?: string; star
     startDraftChapter,
     draftChapter,
     compileContext,
+    quality,
+    qualityReview,
+    estimateReview,
     setApiKey: (value: string) => {
       apiKey = value;
     },
@@ -205,6 +245,29 @@ function createHarness(options: { project?: ProjectDetail; apiKey?: string; star
 }
 
 describe("chapter generation coordinator", () => {
+  it("refuses to start without the required quality service and estimate callback", () => {
+    expect(() => createChapterGenerationCoordinator({} as ChapterGenerationDependencies)).toThrow("共享质检服务");
+    const missingEstimate = {
+      quality: { run: vi.fn(), reusable: vi.fn() },
+    } as unknown as ChapterGenerationDependencies;
+    expect(() => createChapterGenerationCoordinator(missingEstimate)).toThrow("审稿估算");
+  });
+
+  it("returns the saved draft if review throws and the post-review reload also fails", async () => {
+    const h = createHarness();
+    h.quality.run.mockImplementation(async () => {
+      h.getProject.mockImplementation(() => {
+        throw new Error("重载失败");
+      });
+      throw new Error("检查失败");
+    });
+    await expect(h.coordinator.generateOne("project-1", "chapter-1")).resolves.toMatchObject({
+      content: "AI 生成正文",
+      qualityCheck: { status: "未完成检查" },
+    });
+    expect(h.saveGeneratedChapter).toHaveBeenCalledTimes(1);
+    expect(h.markAiJobApplicationFailed).not.toHaveBeenCalled();
+  });
   it.each([
     {
       name: "unapproved contract",
@@ -287,7 +350,7 @@ describe("chapter generation coordinator", () => {
       }),
     );
 
-    await expect(task.completion).resolves.toBe(harness.generatedChapter);
+    await expect(task.completion).resolves.toMatchObject(harness.generatedChapter);
     expect(harness.saveGeneratedChapter).toHaveBeenCalledWith(
       "project-1",
       harness.generatedChapter,
@@ -344,14 +407,20 @@ describe("chapter generation coordinator", () => {
     project.chapters[1].content = "已有正文";
     project.chapters[1].wordCount = 4;
     const harness = createHarness({ project });
+    harness.quality.reusable.mockReturnValue(harness.qualityReview(project.chapters[1].id));
 
     const generated = await harness.coordinator.generateBatch("project-1", "chapter-1");
 
-    expect(generated).toHaveLength(5);
-    expect(generated[1]).toBe(project.chapters[1]);
+    expect(generated.status).toBe("completed");
+    expect(generated.chapters).toHaveLength(5);
+    expect(generated.chapters[1]).toMatchObject(project.chapters[1]);
     expect(harness.draftChapter.mock.calls.map((call) => call[1].number)).toEqual([1, 3, 4, 5]);
     expect(harness.saveGeneratedChapter).toHaveBeenCalledTimes(4);
-    expect(harness.compileContext).toHaveBeenCalledWith(project, project.chapters[0], harness.relevantFacts);
+    expect(harness.compileContext).toHaveBeenCalledWith(
+      project,
+      expect.objectContaining({ id: "chapter-1", content: "" }),
+      harness.relevantFacts,
+    );
     expect(harness.draftChapter.mock.calls[0][3]).toContain('"kind":"batch"');
     expect(harness.coordinator.isActive("project-1")).toBe(false);
   });
@@ -376,8 +445,92 @@ describe("chapter generation coordinator", () => {
       })
       .mockRejectedValueOnce(new Error("batch failed"));
 
-    await expect(harness.coordinator.generateBatch("project-1", "chapter-1")).rejects.toThrow("batch failed");
+    await expect(harness.coordinator.generateBatch("project-1", "chapter-1")).resolves.toMatchObject({
+      status: "paused",
+      stoppedAtChapter: 2,
+      reason: expect.stringContaining("batch failed"),
+      chapters: [expect.objectContaining({ number: 1 })],
+    });
     expect(harness.saveGeneratedChapter).toHaveBeenCalledTimes(1);
     expect(harness.coordinator.isActive("project-1")).toBe(false);
+  });
+
+  it("saves each draft before checking and stops before the third draft on conflict", async () => {
+    const h = createHarness();
+    h.quality.run.mockImplementation(async (_id, chapterId) => {
+      expect(h.project.chapters.find((entry) => entry.id === chapterId)?.content).toContain("AI 正文");
+      const review = h.qualityReview(chapterId);
+      const current = h.project.chapters.find((entry) => entry.id === chapterId);
+      if (current) current.qualityCheck = review.check;
+      if (chapterId === "chapter-2") {
+        review.check.status = "有冲突";
+        review.issues.push({
+          id: "hard",
+          projectId: "project-1",
+          chapterId,
+          severity: "硬性",
+          category: "事实冲突",
+          message: "身份冲突",
+          evidence: "两份引文",
+          status: "待处理",
+          createdAt: timestamp,
+        });
+      }
+      return review;
+    });
+    const result = await h.coordinator.generateBatch("project-1", "chapter-1");
+    expect(result).toMatchObject({
+      status: "paused",
+      stoppedAtChapter: 2,
+      chapters: [expect.objectContaining({ number: 1 }), expect.objectContaining({ number: 2 })],
+    });
+    expect(h.draftChapter).toHaveBeenCalledTimes(2);
+    expect(h.quality.run).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps a single saved draft when review is cancelled and keeps the lock until review settles", async () => {
+    const h = createHarness();
+    const pending = deferred<CheckedChapterQualityReview>();
+    h.quality.run.mockReturnValueOnce(pending.promise);
+    const task = h.coordinator.startOne("project-1", "chapter-1");
+    await vi.waitFor(() => expect(h.quality.run).toHaveBeenCalledTimes(1));
+    expect(h.saveGeneratedChapter).toHaveBeenCalledTimes(1);
+    expect(h.coordinator.isActive("project-1")).toBe(true);
+    const review = h.qualityReview("chapter-1");
+    review.check.status = "未完成检查";
+    review.check.reason = "任务已取消";
+    pending.resolve(review);
+    await expect(task.completion).resolves.toMatchObject({
+      content: "AI 生成正文",
+      qualityCheck: { status: "未完成检查", reason: "任务已取消" },
+    });
+    expect(h.markAiJobApplicationFailed).not.toHaveBeenCalled();
+    expect(h.coordinator.isActive("project-1")).toBe(false);
+  });
+
+  it("does not silently recheck existing content without a matching complete review", async () => {
+    const h = createHarness();
+    h.project.chapters[0].content = "作者已有正文";
+    const result = await h.coordinator.generateBatch("project-1", "chapter-1");
+    expect(result).toMatchObject({
+      status: "paused",
+      stoppedAtChapter: 1,
+      reason: expect.stringContaining("手动检查"),
+    });
+    expect(h.draftChapter).not.toHaveBeenCalled();
+    expect(h.quality.run).not.toHaveBeenCalled();
+  });
+
+  it("uses the same override for reused checks and reviews without charging twice", async () => {
+    const h = createHarness();
+    h.project.chapters[0].content = "已检查正文";
+    h.quality.reusable.mockReturnValue(h.qualityReview("chapter-1"));
+    const override = { profileId: "review-source", model: "review-model" };
+    const result = await h.coordinator.generateBatch("project-1", "chapter-1", override);
+    expect(result.status).toBe("completed");
+    expect(h.quality.reusable).toHaveBeenCalledWith("project-1", "chapter-1", override);
+    expect(h.draftChapter).toHaveBeenCalledTimes(4);
+    expect(h.quality.run).toHaveBeenCalledTimes(4);
+    expect(h.quality.run).toHaveBeenCalledWith("project-1", "chapter-2", { trigger: "after-generation", override });
   });
 });

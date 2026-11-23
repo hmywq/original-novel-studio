@@ -1,15 +1,7 @@
-import { LoaderCircle, ScanText } from "lucide-react";
 import { Badge, Button, Field, Modal, Select, Textarea } from "../components/UI";
 import { formatCount } from "../lib/format";
 import { estimateCjkTextTokens, TOKEN_ESTIMATE_WARNING } from "../shared/token-estimator";
-import type {
-  AiSettings,
-  Genre,
-  ImportPreview,
-  RankingEntry,
-  ResearchAnalysisRecord,
-  ResearchBook,
-} from "../shared/types";
+import type { AiSettings, Genre, ImportPreview, ResearchAnalysisRecord, ResearchBook } from "../shared/types";
 import { GENRES } from "../shared/types";
 import styles from "./ResearchPage.module.css";
 
@@ -49,62 +41,6 @@ function buildPastedPreview(text: string): ImportPreview {
   };
 }
 
-interface PublicSampleModalProps {
-  entry: RankingEntry | null;
-  cloudConsent: boolean;
-  reading: boolean;
-  onCloudConsentChange: (value: boolean) => void;
-  onClose: () => void;
-  onImportAndDeconstruct: () => void;
-}
-
-function PublicSampleModal({
-  entry,
-  cloudConsent,
-  reading,
-  onCloudConsentChange,
-  onClose,
-  onImportAndDeconstruct,
-}: PublicSampleModalProps) {
-  if (!entry) return null;
-  return (
-    <Modal title="读取公开前10章并拆书" onClose={() => !reading && onClose()}>
-      <div className="form-stack">
-        <div className={styles.sourcePreview}>
-          <ScanText size={20} />
-          <span>
-            <strong>{entry.title}</strong>
-            <small>{entry.author} · 番茄小说官方公开试读</small>
-          </span>
-        </div>
-        <p className="inline-warning">
-          只读取官方详情页公开的第1至第10章。遇到登录、付费、验证或正文无法可靠识别时立即停止；结论仅代表开篇样本。
-        </p>
-        <label className="checkbox-line">
-          <input
-            type="checkbox"
-            checked={cloudConsent}
-            onChange={(event) => onCloudConsentChange(event.target.checked)}
-          />
-          <span>允许将这10章正文发送到已配置的 AI 进行语义拆书</span>
-        </label>
-        <div className="modal-actions">
-          <Button variant="secondary" disabled={reading} onClick={onClose}>
-            取消
-          </Button>
-          <Button
-            disabled={reading}
-            icon={reading ? <LoaderCircle className="spin" size={16} /> : <ScanText size={16} />}
-            onClick={onImportAndDeconstruct}
-          >
-            {reading ? "正在读取" : "读取并拆书"}
-          </Button>
-        </div>
-      </div>
-    </Modal>
-  );
-}
-
 interface PasteSampleModalProps {
   open: boolean;
   text: string;
@@ -139,11 +75,12 @@ interface ImportPreviewModalProps {
   genre: Genre;
   rightsConfirmed: boolean;
   cloudConsent: boolean;
+  busy: boolean;
   onGenreChange: (value: Genre) => void;
   onRightsConfirmedChange: (value: boolean) => void;
   onCloudConsentChange: (value: boolean) => void;
   onClose: () => void;
-  onCommit: () => void;
+  onCommit: (analyze: boolean) => void;
 }
 
 function ImportPreviewModal({
@@ -151,6 +88,7 @@ function ImportPreviewModal({
   genre,
   rightsConfirmed,
   cloudConsent,
+  busy,
   onGenreChange,
   onRightsConfirmedChange,
   onCloudConsentChange,
@@ -159,7 +97,7 @@ function ImportPreviewModal({
 }: ImportPreviewModalProps) {
   if (!preview) return null;
   return (
-    <Modal title="确认样本导入" onClose={onClose} width={760}>
+    <Modal title="确认样本导入" onClose={() => !busy && onClose()} width={760}>
       <div className={styles.importPreview}>
         <div className={styles.previewSummary}>
           <span>
@@ -189,7 +127,7 @@ function ImportPreviewModal({
         </div>
         <div className="form-grid">
           <Field label="题材">
-            <Select value={genre} onChange={(event) => onGenreChange(event.target.value as Genre)}>
+            <Select disabled={busy} value={genre} onChange={(event) => onGenreChange(event.target.value as Genre)}>
               {GENRES.map((item) => (
                 <option key={item}>{item}</option>
               ))}
@@ -199,6 +137,7 @@ function ImportPreviewModal({
         <label className="check-row">
           <input
             type="checkbox"
+            disabled={busy}
             checked={rightsConfirmed}
             onChange={(event) => onRightsConfirmedChange(event.target.checked)}
           />
@@ -207,17 +146,21 @@ function ImportPreviewModal({
         <label className="check-row">
           <input
             type="checkbox"
+            disabled={busy}
             checked={cloudConsent}
             onChange={(event) => onCloudConsentChange(event.target.checked)}
           />
           <span>允许本地脱敏后按章发送给已配置的云模型</span>
         </label>
         <div className="modal-actions">
-          <Button variant="secondary" onClick={onClose}>
+          <Button variant="ghost" disabled={busy} onClick={onClose}>
             取消
           </Button>
-          <Button disabled={!rightsConfirmed} onClick={onCommit}>
-            导入研究隔离区
+          <Button variant="secondary" disabled={!rightsConfirmed || busy} onClick={() => onCommit(false)}>
+            仅导入
+          </Button>
+          <Button disabled={!rightsConfirmed || busy} onClick={() => onCommit(true)}>
+            {busy ? "正在导入…" : cloudConsent ? "导入并确认云拆书" : "导入并本地拆书"}
           </Button>
         </div>
       </div>
@@ -328,7 +271,6 @@ function CloudDeconstructModal({ book, aiSettings, onClose, onConfirm }: CloudDe
 }
 
 export interface ResearchSampleModalsProps {
-  publicSampleModal: PublicSampleModalProps;
   pasteModal: PasteSampleModalProps;
   importPreviewModal: ImportPreviewModalProps;
   analysisModal: ResearchAnalysisModalProps;
@@ -336,7 +278,6 @@ export interface ResearchSampleModalsProps {
 }
 
 export function ResearchSampleModals({
-  publicSampleModal,
   pasteModal,
   importPreviewModal,
   analysisModal,
@@ -344,7 +285,6 @@ export function ResearchSampleModals({
 }: ResearchSampleModalsProps) {
   return (
     <>
-      <PublicSampleModal {...publicSampleModal} />
       <PasteSampleModal {...pasteModal} />
       <ImportPreviewModal {...importPreviewModal} />
       <ResearchAnalysisModal {...analysisModal} />

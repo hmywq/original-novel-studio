@@ -1,7 +1,7 @@
 import { contextBandOf } from "./context-layout";
 import type { ContextDiagnostics, ContextPackage, ContextSectionDiagnostic } from "./types";
 
-export type ContextContentKey = Exclude<keyof ContextPackage, "estimatedTokens" | "diagnostics">;
+export type ContextContentKey = ContextSectionDiagnostic["key"];
 
 export interface ContextSectionMetadata {
   source: string;
@@ -19,6 +19,7 @@ export const CONTEXT_SECTION_LABELS: Record<ContextContentKey, string> = {
   volumeGoal: "当前卷目标",
   rollingOutline: "滚动章纲",
   recentSummary: "近期摘要",
+  continuity: "跨章连续性依据",
   relevantFacts: "相关事实",
   storyEntries: "设定条目",
   forbiddenKnowledge: "禁止泄露信息",
@@ -38,6 +39,10 @@ const DEFAULT_METADATA: Record<ContextContentKey, ContextSectionMetadata> = {
     reason: "避免当前章破坏近期结构和后续兑现",
   },
   recentSummary: { source: "当前章节之前的章节摘要（按预算取最近窗口）", reason: "承接既有事件、人物行动和局势变化" },
+  continuity: {
+    source: "当前章之前的有限前文原文（区分待审与定稿）",
+    reason: "保留称谓、日期、物件状态与已完成动作的可核对依据",
+  },
   relevantFacts: { source: "检索后当前有效且已确认的相关事实", reason: "约束人物、关系、能力、资源、地点和时间线" },
   storyEntries: {
     source: "本章命中的设定条目（按提及、生效区间与揭示进度筛选）",
@@ -50,8 +55,8 @@ const DEFAULT_METADATA: Record<ContextContentKey, ContextSectionMetadata> = {
 
 const EMPTY_MARKERS = /^(?:无|暂无|未填写|尚无|尚未)/;
 
-export function contextForModel(context: ContextPackage): Omit<ContextPackage, "diagnostics"> {
-  const { diagnostics: _diagnostics, ...modelContext } = context;
+export function contextForModel(context: ContextPackage): Omit<ContextPackage, "diagnostics" | "continuitySources"> {
+  const { diagnostics: _diagnostics, continuitySources: _continuitySources, ...modelContext } = context;
   return modelContext;
 }
 

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   AutosaveCoordinator,
+  chapterDraftSignature,
   chapterRecoveryKey,
   readRecoveredChapter,
   writeRecoveredChapter,
@@ -32,6 +33,29 @@ const deferred = <T>() => {
 };
 
 describe("chapter draft reliability", () => {
+  it("keeps read-only quality metadata out of dirty signatures and recovered drafts", () => {
+    const server = chapter("服务端稿件", "chapter-1", "2026-01-01T00:00:00.000Z");
+    const qualityCheck: NonNullable<Chapter["qualityCheck"]> = {
+      runId: "stale",
+      status: "已通过",
+      chapterFingerprint: "old",
+      inputFingerprint: "old",
+      checkedAt: null,
+      issueIds: [],
+      observations: [],
+      reason: null,
+    };
+    expect(chapterDraftSignature({ ...server, qualityCheck })).toBe(chapterDraftSignature(server));
+    const recovered = { ...server, content: "恢复正文", qualityCheck };
+    const result = readRecoveredChapter("project", server, { getItem: () => JSON.stringify(recovered) });
+    expect(result.content).toBe("恢复正文");
+    expect(result.qualityCheck).toBeUndefined();
+    const fresh = { ...qualityCheck, runId: "server", status: "未完成检查" as const };
+    expect(
+      readRecoveredChapter("project", { ...server, qualityCheck: fresh }, { getItem: () => JSON.stringify(recovered) })
+        .qualityCheck,
+    ).toEqual(fresh);
+  });
   it("serializes in-flight saves and persists the newest rapid edit", async () => {
     const first = deferred<Chapter>();
     const saved: string[] = [];

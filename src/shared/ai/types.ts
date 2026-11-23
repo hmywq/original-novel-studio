@@ -9,13 +9,21 @@ export type ApiSurface = "openai-chat" | "openai-responses" | "anthropic-message
 export type ApiSurfacePreference = ApiSurface | "auto";
 
 /** 任务角色：决定用哪个来源的哪个模型。 */
-export type ModelRole = "draft" | "plan" | "review" | "extract" | "utility";
+export type ModelRole = "draft" | "plan" | "concept" | "review" | "extract" | "utility";
 
-export const MODEL_ROLES = ["draft", "plan", "review", "extract", "utility"] as const satisfies readonly ModelRole[];
+export const MODEL_ROLES = [
+  "draft",
+  "plan",
+  "concept",
+  "review",
+  "extract",
+  "utility",
+] as const satisfies readonly ModelRole[];
 
 export const MODEL_ROLE_LABELS: Record<ModelRole, string> = {
   draft: "正文 / 修订",
   plan: "结构 / 章纲",
+  concept: "选题生成",
   review: "语义质检",
   extract: "状态提取 / 拆书",
   utility: "连接测试 / 小任务",
@@ -34,7 +42,7 @@ export interface ModelPricing {
 /** 结构化输出的最高可用档位。 */
 export type StructuredOutputMode = "native" | "json-mode" | "prompt-only";
 
-export type CapabilitySource = "catalog" | "remote" | "probe" | "user" | "default";
+export type CapabilitySource = "catalog" | "provider-catalog" | "remote" | "probe" | "user" | "default";
 
 export interface ModelCapabilities {
   apiSurface: ApiSurface;
@@ -88,7 +96,7 @@ export interface AiProfileView extends AiProfile {
 /** 某个来源的模型候选；只含标识与来源，不含密钥与请求细节。 */
 export interface AiProfileModelOption {
   modelId: string;
-  /** remote=远端清单，probe=实际用过并探测过，user=用户手填。 */
+  /** remote=来源 API 清单，provider-catalog=服务商公开目录，probe=实际探测，user=用户手填。 */
   source: CapabilitySource;
   /** 能力行写入时间；手工填写的模型取合成时间。 */
   fetchedAt: string;

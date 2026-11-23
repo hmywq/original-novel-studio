@@ -1,11 +1,12 @@
 import { spawn } from "node:child_process";
 import { injectFault } from "./fault-injection";
 
-const API_TARGET = "cn.local.fanqie.novelstudio/model-api";
-const AUTO_BACKUP_TARGET = "cn.local.fanqie.novelstudio/auto-backup";
-const PROXY_TARGET = "cn.local.fanqie.novelstudio/outbound-proxy";
+const CREDENTIAL_NAMESPACE = "cn.local.original.novelstudio";
+const API_TARGET = `${CREDENTIAL_NAMESPACE}/model-api`;
+const AUTO_BACKUP_TARGET = `${CREDENTIAL_NAMESPACE}/auto-backup`;
+const PROXY_TARGET = `${CREDENTIAL_NAMESPACE}/outbound-proxy`;
 /** 每个 AI 来源一个凭据：前缀 + 来源 id。 */
-const AI_PROFILE_PREFIX = "cn.local.fanqie.novelstudio/ai/";
+const AI_PROFILE_PREFIX = `${CREDENTIAL_NAMESPACE}/ai/`;
 
 const script = `
 $ErrorActionPreference = 'Stop'

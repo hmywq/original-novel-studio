@@ -44,6 +44,8 @@ const LENGTH_SHAPE_STRUCTURE: Record<LengthShape, { stages: [number, number]; vo
   单元剧: { stages: [4, 6], volumes: [4, 6] },
   多卷史诗: { stages: [5, 8], volumes: [5, 8] },
   日常经营: { stages: [4, 6], volumes: [3, 5] },
+  短剧改编向: { stages: [3, 5], volumes: [1, 2] },
+  万字短篇: { stages: [5, 5], volumes: [1, 1] },
 };
 
 /** 未知分类时的全局兜底，等于改造前的固定默认值。 */
@@ -157,6 +159,8 @@ export const CHAPTERS_PER_LADDER_LEVEL: Record<LengthShape, number> = {
   单元剧: 45,
   多卷史诗: 70,
   日常经营: 50,
+  短剧改编向: 6,
+  万字短篇: 1,
 };
 
 export function isLengthShapeName(value: string | undefined): value is LengthShape {

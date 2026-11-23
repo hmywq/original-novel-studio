@@ -8,6 +8,7 @@ const api: AppApi = {
   getDashboard: () => invoke("getDashboard"),
   listProjects: () => invoke("listProjects"),
   createProject: (input) => invoke("createProject", input),
+  createProjectFromTemplate: (input) => invoke("createProjectFromTemplate", input),
   generateBookConcepts: (input) => invoke("generateBookConcepts", input),
   createProjectFromConcept: (input, concept) => invoke("createProjectFromConcept", input, concept),
   listIncubations: () => invoke("listIncubations"),
@@ -72,6 +73,8 @@ const api: AppApi = {
   runRankingSchedule: (id) => invoke("runRankingSchedule", id),
   deleteRankingSchedule: (id) => invoke("deleteRankingSchedule", id),
   getRankingAnalytics: () => invoke("getRankingAnalytics"),
+  listResearchSelections: () => invoke("listResearchSelections"),
+  saveResearchSelection: (input) => invoke("saveResearchSelection", input),
   listResearchBooks: () => invoke("listResearchBooks"),
   previewResearchFile: () => invoke("previewResearchFile"),
   importResearchBook: (preview, genre, rightsConfirmed, cloudConsent) =>
@@ -80,6 +83,7 @@ const api: AppApi = {
     invoke("importPublicResearchSample", sourceUrl, genre, cloudConsent),
   listInsights: () => invoke("listInsights"),
   createInsight: (input) => invoke("createInsight", input),
+  updateInsight: (id, edits) => invoke("updateInsight", id, edits),
   deconstructResearchBook: (bookId) => invoke("deconstructResearchBook", bookId),
   listResearchAnalyses: (bookId) => invoke("listResearchAnalyses", bookId),
   attachInsights: (id, insightIds) => invoke("attachInsights", id, insightIds),
@@ -99,7 +103,7 @@ const api: AppApi = {
       ipcRenderer.removeListener("studio:chapter-draft-stream", listener);
     }
   },
-  previewChapterBatch: (id, chapterId) => invoke("previewChapterBatch", id, chapterId),
+  previewChapterBatch: (id, chapterId, override) => invoke("previewChapterBatch", id, chapterId, override),
   generateChapterBatch: (id, chapterId, override) => invoke("generateChapterBatch", id, chapterId, override),
   getAiSettings: () => invoke("getAiSettings"),
   testAiConnection: (override) => invoke("testAiConnection", override),

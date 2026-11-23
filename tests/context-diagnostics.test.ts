@@ -18,6 +18,25 @@ const context = (): ContextPackage => ({
 });
 
 describe("context diagnostics", () => {
+  it("omits local continuity validation sources from model object and diagnostics keys", () => {
+    const value = {
+      ...context(),
+      continuity: "待审前文摘要",
+      continuitySources: [
+        {
+          id: "local",
+          kind: "前文" as const,
+          chapterNumber: 1,
+          authority: "待审前文" as const,
+          text: "此段只作引用校验",
+        },
+      ],
+    };
+    expect(contextForModel(value)).not.toHaveProperty("continuitySources");
+    const diagnostics = buildContextDiagnostics(value);
+    expect(diagnostics.sections.some((section) => String(section.key) === "continuitySources")).toBe(false);
+    expect(diagnostics.sections.find((section) => section.key === "continuity")?.band).toBe("fast");
+  });
   it("explains included, truncated and missing context without changing model input", () => {
     const value = context();
     value.diagnostics = buildContextDiagnostics(

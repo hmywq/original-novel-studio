@@ -12,6 +12,7 @@ test("starts the production Electron app and persists through the preload API", 
       ...process.env,
       NODE_ENV: "test",
       NOVEL_STUDIO_WORKSPACE: workspace,
+      NOVEL_STUDIO_USER_DATA: path.join(workspace, "test-profile"),
       NOVEL_STUDIO_DISABLE_SINGLE_INSTANCE_LOCK: "1",
     },
   });
@@ -183,7 +184,7 @@ test("starts the production Electron app and persists through the preload API", 
 });
 
 test("starts the packaged Windows application", async () => {
-  const executablePath = path.join(process.cwd(), "release", "win-unpacked", "长篇创作工作台.exe");
+  const executablePath = path.join(process.cwd(), "release", "win-unpacked", "原创小说工作台.exe");
   test.skip(process.platform !== "win32" || !existsSync(executablePath), "packaged Windows app is not available");
   const workspace = mkdtempSync(path.join(os.tmpdir(), "novel-packaged-smoke-"));
   const application = await electron.launch({
@@ -192,6 +193,7 @@ test("starts the packaged Windows application", async () => {
       ...process.env,
       NODE_ENV: "test",
       NOVEL_STUDIO_WORKSPACE: workspace,
+      NOVEL_STUDIO_USER_DATA: path.join(workspace, "test-profile"),
       NOVEL_STUDIO_DISABLE_SINGLE_INSTANCE_LOCK: "1",
     },
   });

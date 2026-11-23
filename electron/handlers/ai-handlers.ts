@@ -2,15 +2,16 @@ import type { TaskModelOverride } from "../../src/shared/ai/types";
 import type {
   BatchGenerationPreview,
   Chapter,
+  ChapterBatchGenerationResult,
   ChapterDraftStreamEvent,
   ContextPackage,
   PlanningGenerationResult,
   PlanningRepairInput,
   ProjectDetail,
-  QualityIssue,
 } from "../../src/shared/types";
 import { assertChapterRetrySnapshot, createChapterGenerationGuard, validateChapterAiRetrySource } from "../ai-retry";
 import type { AiService, StartedAiTask } from "../ai-service";
+import type { ChapterQualityService } from "../chapter-quality-service";
 import type { WorkspaceDatabase } from "../database";
 import { analyzeRankings } from "../ranking-service";
 import type { RegisterHandler } from "./types";
@@ -56,7 +57,6 @@ export interface AiHandlerDependencies {
     | "generateConcepts"
     | "generatePlanning"
     | "judgeChapterDrafts"
-    | "reviewChapter"
     | "reviewPlanning"
     | "reviseChapter"
     | "testConnection"
@@ -77,21 +77,14 @@ export interface AiHandlerDependencies {
     project: ProjectDetail,
     settings: ReturnType<WorkspaceDatabase["getAiSettings"]>,
     chapterId: string,
+    override?: TaskModelOverride,
   ) => BatchGenerationPreview;
-  generateChapterBatch: (projectId: string, chapterId: string, override?: TaskModelOverride) => Promise<Chapter[]>;
-  runLocalQualityCheck: (input: {
-    projectId: string;
-    chapter: Chapter;
-    previousChapter: Chapter | undefined;
-    recentChapters: Chapter[];
-    facts: ProjectDetail["facts"];
-    contract: ProjectDetail["contract"];
-    genre: ProjectDetail["summary"]["genre"];
-    originalityMatches: ReturnType<WorkspaceDatabase["findOriginalityMatches"]>;
-    aiFlavorWhitelist?: string[];
-  }) => Promise<{ issues: QualityIssue[]; observations: string[] }>;
-  createId: () => string;
-  currentTimestamp: () => string;
+  generateChapterBatch: (
+    projectId: string,
+    chapterId: string,
+    override?: TaskModelOverride,
+  ) => Promise<ChapterBatchGenerationResult>;
+  quality: ChapterQualityService;
   isGenerationActive: (projectId: string) => boolean;
   markGenerationActive: (projectId: string) => void;
   markGenerationIdle: (projectId: string) => void;
@@ -114,9 +107,7 @@ export function registerAiHandlers({
   sendChapterDraftStream,
   previewChapterBatch,
   generateChapterBatch,
-  runLocalQualityCheck,
-  createId,
-  currentTimestamp,
+  quality,
   isGenerationActive,
   markGenerationActive,
   markGenerationIdle,
@@ -128,105 +119,7 @@ export function registerAiHandlers({
   startChapterRetry,
   logRetryFailure,
 }: AiHandlerDependencies): void {
-  register("runQualityCheck", async (id, chapterId, override) => {
-    const project = database.getProject(id);
-    const chapter = project.chapters.find((item) => item.id === chapterId);
-    if (!chapter) throw new Error("章节不存在");
-    const facts = database.searchRelevantFacts(
-      id,
-      `${chapter.title} ${chapter.outline} ${chapter.content.slice(0, 500)}`,
-      chapter.number,
-    );
-    const local = await runLocalQualityCheck({
-      projectId: id,
-      chapter,
-      previousChapter: project.chapters.find((item) => item.number === chapter.number - 1),
-      recentChapters: project.chapters.filter((item) => item.number < chapter.number).slice(-12),
-      facts: project.facts,
-      contract: project.contract,
-      genre: project.summary.genre,
-      originalityMatches: database.findOriginalityMatches(chapter.content),
-      aiFlavorWhitelist: project.aiFlavorWhitelist,
-    });
-    const localIssues = local.issues;
-    const intentIssues: QualityIssue[] = [
-      ["本章承诺", chapter.chapterPromise],
-      ["预期回报", chapter.expectedPayoff],
-      ["当前危机", chapter.crisis],
-      ["结尾期待", chapter.endingExpectation],
-    ]
-      .filter(([, value]) => !String(value ?? "").trim())
-      .map(([label]) => ({
-        id: createId(),
-        projectId: id,
-        chapterId,
-        severity: "建议" as const,
-        category: "章节商业意图",
-        message: `${label}尚未规划，建议在写作台补充后再判断本章闭环。`,
-        evidence: "",
-        status: "待处理" as const,
-        createdAt: currentTimestamp(),
-      }));
-    const dueExpectationIssues: QualityIssue[] = project.expectations
-      .filter(
-        (item) =>
-          (item.status === "待兑现" || item.status === "部分兑现") &&
-          item.expectedPayoffChapter !== null &&
-          item.expectedPayoffChapter <= chapter.number &&
-          !chapter.linkedExpectationIds?.includes(item.id),
-      )
-      .map((item) => ({
-        id: createId(),
-        projectId: id,
-        chapterId,
-        severity: "建议" as const,
-        category: "期待兑现",
-        message: `“${item.title}”已到预计兑现章，但本章未标记承接；请确认延期、部分兑现或调整目标章。`,
-        evidence: `第${item.sourceChapter}章提出`,
-        status: "待处理" as const,
-        createdAt: currentTimestamp(),
-      }));
-    let semanticIssues: QualityIssue[] = [];
-    let observations = [...local.observations];
-    if (hasAiCredential()) {
-      try {
-        const review = await ai.reviewChapter(
-          { ...project, facts },
-          chapter,
-          compileContext(project, chapter, facts),
-          override,
-        );
-        semanticIssues = review.issues;
-        observations = [...observations, ...review.observations];
-      } catch (error) {
-        semanticIssues = [
-          {
-            id: createId(),
-            projectId: id,
-            chapterId,
-            severity: "警告",
-            category: "语义质检",
-            message: "云端语义质检未完成，本次结果仅包含本地规则检查。",
-            evidence: error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300),
-            status: "待处理",
-            createdAt: currentTimestamp(),
-          },
-        ];
-      }
-    }
-    const seen = new Set<string>();
-    const issues = [...localIssues, ...intentIssues, ...dueExpectationIssues, ...semanticIssues].filter((issue) => {
-      const key = `${issue.category}\n${issue.message}\n${issue.evidence}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-    database.saveIssues(id, chapterId, issues);
-    if (chapter.status === "草稿") {
-      database.transitionChapter(id, chapterId, "待质检");
-    }
-    return { issues, observations };
-  });
+  register("runQualityCheck", (id, chapterId, override) => quality.run(id, chapterId, { trigger: "manual", override }));
   register("judgeChapterDrafts", async (id, input, override) => {
     const project = database.getProject(id);
     return ai.judgeChapterDrafts(project, input, override);
@@ -282,8 +175,8 @@ export function registerAiHandlers({
       override,
     ),
   );
-  register("previewChapterBatch", (id, chapterId) =>
-    previewChapterBatch(database.getProject(id), database.getAiSettings(), chapterId),
+  register("previewChapterBatch", (id, chapterId, override) =>
+    previewChapterBatch(database.getProject(id), database.getAiSettings(), chapterId, override),
   );
   register("generateChapterBatch", (id, chapterId, override) => generateChapterBatch(id, chapterId, override));
   register("transitionChapter", (id, chapterId, status) => {

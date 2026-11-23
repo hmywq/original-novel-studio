@@ -46,6 +46,7 @@ type RouteDatabase = Pick<
 export function roleForTask(taskType: string): ModelRole {
   if (taskType === "draft-chapter" || taskType === "revise-chapter-quality") return "draft";
   if (taskType === "connection-test" || taskType === "suggest-aesthetic-profile") return "utility";
+  if (taskType === "generate-book-concepts" || taskType === "generate-book-concepts-diversity-retry") return "concept";
   // 裁判任务复用质检角色：默认与写作模型分离，避免自评自判（新增独立角色需要改设置页与角色校验）。
   if (taskType === "quality-review" || taskType === "judge") return "review";
   if (taskType.startsWith("deconstruct-") || taskType === "extract-chapter-facts") return "extract";

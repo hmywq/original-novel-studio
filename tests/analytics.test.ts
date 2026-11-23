@@ -1,17 +1,8 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  analyzeRankings,
-  captureFanqieOpeningSample,
-  capturePublicRankingPage,
-  decodeFanqiePublicText,
-  fetchPublicHtml,
-  parseFanqieDetailPage,
-} from "../electron/ranking-service";
+import { describe, expect, it } from "vitest";
+import { analyzeRankings } from "../electron/ranking-service";
 import { analyzeMetrics, parseMetricsCsv, summarizeMetrics } from "../src/shared/metrics";
 import { completeRankingSchedule, failRankingSchedule, nextRankingRun } from "../src/shared/ranking-schedule";
 import type { RankingSnapshot } from "../src/shared/types";
-
-afterEach(() => vi.unstubAllGlobals());
 
 describe("ranking analytics", () => {
   it("reports entrants, movers, distribution, range and confidence", () => {
@@ -200,160 +191,6 @@ describe("ranking analytics", () => {
     ];
     expect(analyzeRankings(snapshots).marketOpportunities[0].genre).toBe("待校对");
   });
-
-  it("times out stalled public page requests", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(
-        (_input: string | URL | Request, init?: RequestInit) =>
-          new Promise((_resolve, reject) => {
-            init?.signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
-          }),
-      ),
-    );
-    await expect(fetchPublicHtml(new URL("https://example.com/rank"), { timeoutMs: 5, attempts: 1 })).rejects.toThrow(
-      "公开页请求超时",
-    );
-  });
-
-  it("stops reading a public page as soon as the body exceeds the limit", async () => {
-    const chunks = [new Uint8Array(3_000_000), new Uint8Array(2_000_001)];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(
-        async () =>
-          new Response(
-            new ReadableStream({
-              start(controller) {
-                for (const chunk of chunks) controller.enqueue(chunk);
-                controller.close();
-              },
-            }),
-          ),
-      ),
-    );
-    await expect(fetchPublicHtml(new URL("https://example.com/rank"), { attempts: 1 })).rejects.toThrow("超过 5MB");
-  });
-
-  it("rejects local and private destinations before fetching", async () => {
-    const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
-    await expect(fetchPublicHtml(new URL("http://127.0.0.1/private"), { attempts: 1 })).rejects.toThrow(
-      /私有网络|本机/,
-    );
-    await expect(fetchPublicHtml(new URL("http://169.254.169.254/latest/meta-data"), { attempts: 1 })).rejects.toThrow(
-      /私有网络|保留地址/,
-    );
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("revalidates every redirect target", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(
-        async () =>
-          new Response(null, {
-            status: 302,
-            headers: { location: "http://127.0.0.1/private" },
-          }),
-      ),
-    );
-    await expect(fetchPublicHtml(new URL("http://93.184.216.34/rank"), { attempts: 1 })).rejects.toThrow(
-      /私有网络|本机/,
-    );
-  });
-
-  it("captures only public page metadata", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(
-        async () =>
-          new Response(
-            `<html><body><article class="book-item"><span class="rank">1</span><a href="/page/123" title="公开书名">公开书名</a><span class="author">公开作者</span><span>都市脑洞 88万字 连载</span></article></body></html>`,
-            { status: 200, headers: { "content-type": "text/html" } },
-          ),
-      ),
-    );
-    const result = await capturePublicRankingPage("https://example.com/rank", "公开榜");
-    expect(result.status).toBe("成功");
-    expect(result.entries[0]).toMatchObject({ title: "公开书名", author: "公开作者", words: 880000 });
-  });
-
-  it("parses public Zongheng ranking cards without duplicating detail links", async () => {
-    const html = `<section><div class="zh-modules-rank-book"><div class="book-rank--title"><a title="示例作品" href="//www.zongheng.com/detail/123">示例作品</a></div><div class="book-rank--hover"><a class="global-hover bookeName" href="//www.zongheng.com/detail/123">示例作品</a><a class="global-hover">示例作者</a><span>12.5 万字 连载</span></div></div></section>`;
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => new Response(html, { status: 200, headers: { "content-type": "text/html" } })),
-    );
-    const snapshot = await capturePublicRankingPage("https://www.zongheng.com/rank", "纵横公开榜单");
-    expect(snapshot.entries).toHaveLength(1);
-    expect(snapshot.entries[0]).toMatchObject({ title: "示例作品", author: "示例作者", words: 125000, status: "连载" });
-    expect(snapshot.entries[0].sourceUrl).toBe("https://www.zongheng.com/detail/123");
-    vi.unstubAllGlobals();
-  });
-
-  it("parses normal metadata from a public Fanqie detail page", () => {
-    const html = `<html><head><title>测试作品完整版在线免费阅读_测试作品小说_番茄小说官网</title><meta name="description" content="番茄小说提供测试作品完整版在线免费阅读，精彩小说尽在番茄小说网。公开简介内容"></head><body><h1>测试作品</h1><div class="info-label"><span>已完结</span><span>古风世情</span><span>古代言情</span></div><div class="info-count-word"><span class="detail">66.6</span><span>万字</span></div><span class="author-name-text">测试作者</span><a href="/reader/456">开始阅读</a></body></html>`;
-    const entry = parseFanqieDetailPage(html, new URL("https://fanqienovel.com/page/123"), "snapshot", 1);
-    expect(entry).toMatchObject({
-      title: "测试作品",
-      author: "测试作者",
-      genre: "古风世情",
-      words: 666000,
-      status: "已完结",
-      synopsis: "公开简介内容",
-      platform: "番茄小说",
-    });
-    expect(entry.officialReaderUrl).toBe("https://fanqienovel.com/reader/456");
-  });
-
-  it("uses Fanqie detail metadata instead of obfuscated ranking text", async () => {
-    const rankHtml = `<div class="rank-item"><a href="/page/123">乱码书名</a><a href="/reader/456">阅读</a></div>`;
-    const detailHtml = `<html><head><title>正常书名完整版在线免费阅读_正常书名小说_番茄小说官网</title><meta name="description" content="番茄小说提供正常书名完整版在线免费阅读，精彩小说尽在番茄小说网。简介"></head><body><h1>正常书名</h1><div class="info-label"><span>连载中</span><span>都市脑洞</span></div><div class="info-count-word">88 万字</div><span class="author-name-text">公开作者</span></body></html>`;
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(
-        async (input: string | URL | Request) =>
-          new Response(String(input).includes("/page/123") ? detailHtml : rankHtml, {
-            status: 200,
-            headers: { "content-type": "text/html" },
-          }),
-      ),
-    );
-    const snapshot = await capturePublicRankingPage("https://fanqienovel.com/rank", "番茄综合榜");
-    expect(snapshot.status).toBe("成功");
-    expect(snapshot.entries[0]).toMatchObject({
-      title: "正常书名",
-      author: "公开作者",
-      genre: "都市脑洞",
-      platform: "番茄小说",
-    });
-    expect(snapshot.entries[0].title).not.toContain("");
-  });
-
-  it("reads exactly ten free public opening chapters and decodes reader text", async () => {
-    const detailHtml = `<h1>开篇样本</h1><span class="author-name-text">作者甲</span>${Array.from({ length: 10 }, (_, index) => `<a href="/reader/${index + 1}">第${index + 1}章 标题${index + 1}</a>`).join("")}`;
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: string | URL | Request) => {
-        const url = String(input);
-        if (url.includes("/page/")) return new Response(detailHtml, { status: 200 });
-        const order = Number(url.split("/").at(-1));
-        const state = {
-          reader: { chapterData: { needPay: 0, order: String(order), title: `第${order}章 标题${order}` } },
-        };
-        return new Response(
-          `<div class="muye-reader-content"><div><p></p><p>公开正文${order}</p></div></div><script>window.__INITIAL_STATE__=${JSON.stringify(state)};</script>`,
-          { status: 200 },
-        );
-      }),
-    );
-    const sample = await captureFanqieOpeningSample("https://fanqienovel.com/page/123");
-    expect(sample).toMatchObject({ title: "开篇样本", author: "作者甲" });
-    expect(sample.chapters).toHaveLength(10);
-    expect(sample.chapters[0]).toMatchObject({ title: "第1章 标题1", content: "1年\n公开正文1" });
-    expect(decodeFanqiePublicText("")).toBe("1955年");
-  });
 });
 
 describe("metric review", () => {
@@ -481,7 +318,7 @@ describe("ranking schedules", () => {
 
   it("advances successful and failed runs to the next cycle", () => {
     const from = new Date("2026-07-30T08:00:00.000Z");
-    expect(nextRankingRun("每日", from)).toBe("2026-07-31T08:00:00.000Z");
+    expect(nextRankingRun("每日", from)).toBe("2026-07-31T07:20:00.000Z");
     expect(nextRankingRun("每周", from)).toBe("2026-08-06T08:00:00.000Z");
     const snapshot: RankingSnapshot = {
       id: "r",
@@ -495,12 +332,12 @@ describe("ranking schedules", () => {
     expect(completeRankingSchedule(schedule, snapshot, from)).toMatchObject({
       lastStatus: "成功",
       lastRunAt: snapshot.capturedAt,
-      nextRunAt: "2026-07-31T08:00:00.000Z",
+      nextRunAt: "2026-07-31T07:20:00.000Z",
     });
     expect(failRankingSchedule(schedule, new Error("访问受限"), from)).toMatchObject({
       lastStatus: "失败",
       lastError: "访问受限",
-      nextRunAt: "2026-07-31T08:00:00.000Z",
+      nextRunAt: "2026-07-31T07:20:00.000Z",
     });
   });
 });

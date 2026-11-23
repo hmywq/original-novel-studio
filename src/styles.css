@@ -3953,7 +3953,7 @@ p {
     top: 0;
     z-index: 30;
     display: grid;
-    grid-template-columns: auto 1fr auto;
+    grid-template-columns: auto minmax(0, 1fr) auto;
     height: 58px;
     border-right: 0;
     border-bottom: 1px solid #171c1a;
@@ -3972,6 +3972,13 @@ p {
     display: flex;
     align-items: center;
     padding: 8px;
+  }
+  .main-nav {
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .main-nav button {
+    flex-shrink: 0;
   }
   .main-nav button,
   .sidebar-bottom button {
@@ -4052,6 +4059,7 @@ p {
     display: none;
   }
   .main-nav button {
+    gap: 0;
     padding: 0 8px;
     font-size: 0;
   }

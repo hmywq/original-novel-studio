@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto";
-import { load } from "cheerio";
+import { createHash, randomUUID } from "node:crypto";
 import { FANQIE_CATEGORY_PROFILES } from "../src/shared/fanqie-taxonomy";
+import { parseRankingCsv } from "../src/shared/ranking-csv";
 import {
   GENRES,
   type MarketOpportunity,
@@ -8,47 +8,76 @@ import {
   type RankingEntry,
   type RankingSnapshot,
 } from "../src/shared/types";
-import { fetchPublicHttpResponse } from "./netguard";
+import { assertPublicHttpUrlSyntax, fetchPublicHttpResponse } from "./netguard";
 
-function parseCompactNumber(value: string) {
-  const match = value.replace(/,/g, "").match(/([0-9]+(?:\.[0-9]+)?)\s*(万)?\s*字?/);
-  if (!match) return 0;
-  return Math.round(Number(match[1]) * (match[2] ? 10000 : 1));
+export const RANKING_CSV_BYTE_LIMIT = 5_000_000;
+const RANKING_CSV_TIMEOUT_MS = 30_000;
+
+export function assertRankingCsvUrl(raw: string): URL {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error("CSV 数据源地址无效");
+  }
+  const hostname = url.hostname.replace(/\.+$/, "");
+  if (hostname === "fanqienovel.com" || hostname.endsWith(".fanqienovel.com"))
+    throw new Error("番茄官网自动采集需要事先授权，请导入有权使用的榜单文件");
+  if (url.protocol !== "https:") throw new Error("CSV 数据源必须使用 HTTPS 地址");
+  assertPublicHttpUrlSyntax(url);
+  return url;
 }
 
-function clean(value: string) {
-  return value.replace(/\s+/g, " ").trim();
-}
-
-const PUBLIC_PAGE_LIMIT = 5_000_000;
-const FANQIE_BOOK_LIMIT = 20;
-const FANQIE_CONCURRENCY = 4;
-const FANQIE_OPENING_CHAPTER_LIMIT = 10;
-const PUBLIC_PAGE_TIMEOUT_MS = 30_000;
-
-async function fetchPublicResponse(url: URL, signal: AbortSignal) {
-  return fetchPublicHttpResponse(
-    url,
-    {
-      signal,
-      headers: {
-        "User-Agent": "NovelStudio/0.1 public-metadata-reader",
-        Accept: "text/html,application/xhtml+xml",
+async function fetchRankingCsv(url: URL): Promise<string> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), RANKING_CSV_TIMEOUT_MS);
+  try {
+    const response = await fetchPublicHttpResponse(
+      url,
+      {
+        signal: controller.signal,
+        headers: {
+          "User-Agent": "NovelStudio/0.7 authorized-ranking-reader",
+          Accept: "text/csv,application/csv",
+        },
       },
-    },
-    { allowCrossOriginRedirect: true },
-  );
-}
+      { allowCrossOriginRedirect: false },
+    );
+    if (!response.ok) throw new Error(`CSV 数据源返回 HTTP ${response.status}`);
+    const contentType = response.headers.get("content-type") ?? "";
+    const mime = contentType.split(";", 1)[0].trim().toLowerCase();
+    if (mime !== "text/csv" && mime !== "application/csv") throw new Error("数据源必须返回 CSV 格式");
+    const charset = /;\s*charset\s*=\s*"?([^;"\s]+)/i.exec(contentType)?.[1].toLowerCase();
+    if (charset && charset !== "utf-8" && charset !== "utf8") throw new Error("CSV 文件必须使用 UTF-8 编码");
 
-// Fanqie's public reader uses a fixed Source Han Sans subset with remapped codepoints.
-// Keep the mapping local so public chapter text is never sent to a third-party decoder.
-const FANQIE_ENCODED_CHARS =
-  "";
-const FANQIE_DECODED_CHARS =
-  "D在主特家军然表场4要只v和6别还g现儿岁此象月3出战工相o男直失世F都平文什VO将真T那当会立些u是十张学气大爱两命全后东性通被1它乐接而感车山公了常以何可话先pi叫轻M士w着变尔快l个说少色里安花远7难师放t报认面道S克地度I好机U民写把万同水新没书电吃像斯5为y白几日教看但第加候作上拉住有法r事应位利你声身国问马女他Y比父xAHNsX边美对所金活回意到z从j知又内因点Q三定8Rb正或夫向德听更得告并本q过记L让打f人就者去原满体做经K走如孩cG给使物最笑部员等受k行一条果动光门头见往自解成处天能于名其发总母的死手入路进心来h时力多开已许d至由很界n小与Z想代么分生口再妈望次西风种带J实情才这E我神格长觉间年眼无不亲关结0友信下却重己老2音字m呢明之前高PB目太e9起稜她也W用方子英每理便四数期中C外样a海们任";
-const FANQIE_CHAR_MAP = new Map(
-  [...FANQIE_ENCODED_CHARS].map((char, index) => [char, [...FANQIE_DECODED_CHARS][index]]),
-);
+    const contentLength = Number(response.headers.get("content-length") ?? 0);
+    if (contentLength > RANKING_CSV_BYTE_LIMIT) throw new Error("CSV 文件超过 5MB 限制");
+    if (!response.body) throw new Error("CSV 数据源未返回文件");
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let length = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      length += value.byteLength;
+      if (length > RANKING_CSV_BYTE_LIMIT) throw new Error("CSV 文件超过 5MB 限制");
+      chunks.push(value);
+    }
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks, length));
+    } catch {
+      throw new Error("CSV 文件必须使用 UTF-8 编码");
+    }
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error("CSV 数据源请求超时（30 秒）");
+    if (error instanceof Error && error.message === "模型服务不允许跨来源重定向")
+      throw new Error("CSV 数据源不允许跨来源重定向");
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    controller.abort();
+  }
+}
 
 export interface PublicOpeningSample {
   title: string;
@@ -57,347 +86,37 @@ export interface PublicOpeningSample {
   chapters: Array<{ title: string; content: string; wordCount: number }>;
 }
 
-export async function fetchPublicHtml(url: URL, options: { timeoutMs?: number; attempts?: number } = {}) {
-  const attempts = Math.max(1, options.attempts ?? 2);
-  let lastError: unknown;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const controller = new AbortController();
-    let timedOut = false;
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, options.timeoutMs ?? PUBLIC_PAGE_TIMEOUT_MS);
-    try {
-      const response = await fetchPublicResponse(url, controller.signal);
-      if (!response.ok) throw new Error(`公开页返回 HTTP ${response.status}`);
-      const length = Number(response.headers.get("content-length") ?? 0);
-      if (length > PUBLIC_PAGE_LIMIT) throw new Error("公开页超过 5MB 安全限制");
-      if (!response.body) return "";
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let bytes = 0;
-      let html = "";
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        bytes += value.byteLength;
-        if (bytes > PUBLIC_PAGE_LIMIT) {
-          controller.abort();
-          throw new Error("公开页超过 5MB 安全限制");
-        }
-        html += decoder.decode(value, { stream: true });
-      }
-      return html + decoder.decode();
-    } catch (error) {
-      lastError = timedOut
-        ? new Error(`公开页请求超时（${Math.ceil((options.timeoutMs ?? PUBLIC_PAGE_TIMEOUT_MS) / 1000)} 秒）`)
-        : error;
-      const message = lastError instanceof Error ? lastError.message : String(lastError);
-      if (/HTTP 4\d\d|超过 5MB/.test(message) || attempt === attempts - 1) throw lastError;
-      await new Promise((resolve) => setTimeout(resolve, 250 * 2 ** attempt));
-    } finally {
-      clearTimeout(timeout);
-    }
-  }
-  throw lastError;
+export function captureFanqieOpeningSample(_sourceUrl: string): Promise<PublicOpeningSample> {
+  return Promise.reject(new Error("在线采集试读样本需要事先授权，请导入有权使用的本地样本"));
 }
 
-export function decodeFanqiePublicText(value: string) {
-  return [...value].map((char) => FANQIE_CHAR_MAP.get(char) ?? char).join("");
-}
-
-function fanqieReaderState($: ReturnType<typeof load>) {
-  const script = $("script")
-    .map((_index, element) => $(element).html() ?? "")
-    .get()
-    .find((value) => value.includes("window.__INITIAL_STATE__="));
-  const marker = "window.__INITIAL_STATE__=";
-  const start = script ? script.indexOf(marker) + marker.length : -1;
-  if (!script || start < marker.length) throw new Error("公开阅读页缺少章节状态");
-  let depth = 0;
-  let quoted = false;
-  let escaped = false;
-  let end = -1;
-  for (let index = start; index < script.length; index += 1) {
-    const char = script[index];
-    if (quoted) {
-      if (escaped) escaped = false;
-      else if (char === "\\") escaped = true;
-      else if (char === '"') quoted = false;
-      continue;
-    }
-    if (char === '"') quoted = true;
-    else if (char === "{") depth += 1;
-    else if (char === "}" && --depth === 0) {
-      end = index + 1;
-      break;
-    }
-  }
-  if (end < 0) throw new Error("公开阅读页章节状态不完整");
-  return JSON.parse(script.slice(start, end)) as {
-    reader?: { chapterData?: { needPay?: number; order?: string; title?: string } };
-  };
-}
-
-export async function captureFanqieOpeningSample(sourceUrl: string): Promise<PublicOpeningSample> {
-  const detailUrl = new URL(sourceUrl);
-  if (
-    !(detailUrl.hostname === "fanqienovel.com" || detailUrl.hostname.endsWith(".fanqienovel.com")) ||
-    !detailUrl.pathname.startsWith("/page/")
-  )
-    throw new Error("只支持番茄小说官方详情页");
-  const detailHtml = await fetchPublicHtml(detailUrl);
-  const detail = load(detailHtml);
-  const title = fanqieBookTitle(detail);
-  if (!title) throw new Error("番茄详情页缺少书名");
-  const author =
-    clean(detail(".author-name-text").first().text()) || clean(detail(".author-name").first().text()) || "未知";
-  const discoveredLinks = detail('a[href*="/reader/"]')
-    .map((_index, element) => {
-      const label = clean(detail(element).text());
-      const order = Number(label.match(/^第\s*(\d+)\s*章/)?.[1]);
-      const href = detail(element).attr("href");
-      return href && order >= 1 && order <= FANQIE_OPENING_CHAPTER_LIMIT
-        ? { order, url: new URL(href, detailUrl) }
-        : null;
-    })
-    .get()
-    .filter((item): item is { order: number; url: URL } => item !== null);
-  const byOrder = new Map(discoveredLinks.map((item) => [item.order, item]));
-  const links = Array.from({ length: FANQIE_OPENING_CHAPTER_LIMIT }, (_value, index) => byOrder.get(index + 1));
-  if (links.some((item) => !item)) throw new Error("详情页未完整提供公开的前 10 章");
-
-  const chapters = await mapWithConcurrency(links as Array<{ order: number; url: URL }>, 3, async ({ order, url }) => {
-    let lastError: unknown;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      try {
-        const html = await fetchPublicHtml(url, { attempts: 1 });
-        const page = load(html);
-        const chapterData = fanqieReaderState(page).reader?.chapterData;
-        if (!chapterData || Number(chapterData.needPay ?? 1) !== 0)
-          throw new Error(`第 ${order} 章需要登录或付费，已停止读取`);
-        if (Number(chapterData.order) !== order) throw new Error(`第 ${order} 章返回了不一致的章节序号`);
-        const paragraphs = page(".muye-reader-content p")
-          .map((_index, element) => clean(page(element).text()))
-          .get()
-          .filter(Boolean);
-        const content = decodeFanqiePublicText(paragraphs.join("\n"));
-        if (!content || /[\uE000-\uF8FF]/.test(content)) throw new Error(`第 ${order} 章公开正文无法可靠识别`);
-        return {
-          title: clean(chapterData.title ?? "") || `第${order}章`,
-          content,
-          wordCount: content.replace(/\s/g, "").length,
-        };
-      } catch (error) {
-        if (error instanceof Error && /登录或付费/.test(error.message)) throw error;
-        lastError = error;
-      }
-    }
-    throw new Error(`第 ${order} 章读取失败：${lastError instanceof Error ? lastError.message : String(lastError)}`);
-  });
-  if (chapters.length < FANQIE_OPENING_CHAPTER_LIMIT)
-    throw new Error(`公开开篇仅识别到 ${chapters.length} 章，未保存不完整样本`);
-  return { title, author, sourceUrl: detailUrl.toString(), chapters };
-}
-
-function fanqieBookTitle($: ReturnType<typeof load>) {
-  const heading = clean($("h1").first().text());
-  if (heading) return heading;
-  return clean($("title").text()).split("完整版在线免费阅读")[0];
-}
-
-export function parseFanqieDetailPage(
-  html: string,
-  detailUrl: URL,
-  snapshotId: string,
-  rank: number,
-  officialReaderUrl?: string,
-): RankingEntry {
-  const $ = load(html);
-  const title = fanqieBookTitle($);
-  if (!title) throw new Error("详情页缺少书名");
-  const labels = $(".info-label span")
-    .map((_index, element) => clean($(element).text()))
-    .get()
-    .filter(Boolean);
-  const status = labels.find((label) => /完结|连载/.test(label)) ?? "未知";
-  const tags = labels.filter((label) => label !== status);
-  const wordsText = clean($(".info-count-word").first().text());
-  const description = clean($('meta[name="description"]').attr("content") ?? "");
-  const synopsis = description
-    .replace(
-      new RegExp(
-        `^番茄小说提供${title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}完整版在线免费阅读，精彩小说尽在番茄小说网。`,
-      ),
-      "",
-    )
-    .trim();
-  const readerHref =
-    $("a[href*='/reader/']")
-      .filter((_index, element) => /^第\s*1\s*章/.test(clean($(element).text())))
-      .first()
-      .attr("href") ?? $("a[href*='/reader/']").first().attr("href");
-  return {
-    id: randomUUID(),
-    snapshotId,
-    rank,
-    title,
-    author: clean($(".author-name-text").first().text()) || clean($(".author-name").first().text()) || "未知",
-    genre: tags[0] ?? "待校对",
-    words: parseCompactNumber(wordsText),
-    status,
-    tags,
-    sourceUrl: detailUrl.toString(),
-    synopsis,
-    officialReaderUrl: readerHref ? new URL(readerHref, detailUrl).toString() : officialReaderUrl,
-    platform: "番茄小说",
-  };
-}
-
-async function mapWithConcurrency<T, R>(items: T[], concurrency: number, work: (item: T, index: number) => Promise<R>) {
-  const results = new Array<R>(items.length);
-  let cursor = 0;
-  async function worker() {
-    while (cursor < items.length) {
-      const index = cursor++;
-      results[index] = await work(items[index], index);
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, () => worker()));
-  return results;
-}
-
-async function parseFanqieRanking($: ReturnType<typeof load>, parsedUrl: URL, snapshotId: string) {
-  const books: Array<{ detailUrl: URL; readerUrl?: string }> = [];
-  const seen = new Set<string>();
-  $('a[href*="/page/"]').each((_index, element) => {
-    if (books.length >= FANQIE_BOOK_LIMIT) return;
-    const href = $(element).attr("href");
-    if (!href) return;
-    const detailUrl = new URL(href, parsedUrl);
-    if (seen.has(detailUrl.toString())) return;
-    seen.add(detailUrl.toString());
-    const container = $(element).closest("li, article, [class*=book], [class*=rank], [class*=item]");
-    const readerHref = container.find('a[href*="/reader/"]').first().attr("href");
-    books.push({ detailUrl, readerUrl: readerHref ? new URL(readerHref, parsedUrl).toString() : undefined });
-  });
-  if (!books.length) throw new Error("番茄榜单页中未识别到公开书籍链接");
-  const failures: string[] = [];
-  const entries = await mapWithConcurrency(books, FANQIE_CONCURRENCY, async (book, index) => {
-    try {
-      const html = await fetchPublicHtml(book.detailUrl);
-      return parseFanqieDetailPage(html, book.detailUrl, snapshotId, index + 1, book.readerUrl);
-    } catch (error) {
-      failures.push(`第 ${index + 1} 本：${error instanceof Error ? error.message : String(error)}`);
-      return null;
-    }
-  });
-  return { entries: entries.filter((entry): entry is RankingEntry => entry !== null), failures };
-}
-
-function parseZongheng($: ReturnType<typeof load>, parsedUrl: URL, snapshotId: string): RankingEntry[] {
-  const entries: RankingEntry[] = [];
-  const seen = new Set<string>();
-  $(".zh-modules-rank-book").each((_index, element) => {
-    const container = $(element);
-    const anchor = container
-      .find('a[href*="/detail/"]')
-      .filter((_i, item) => clean($(item).text()).length > 0)
-      .first();
-    const href = anchor.attr("href") ?? "";
-    const title = clean(anchor.attr("title") || anchor.text());
-    if (!title || seen.has(href || title)) return;
-    seen.add(href || title);
-    const authorLinks = container.find("a.global-hover").filter((_i, item) => clean($(item).text()) !== title);
-    const context = clean(container.text());
-    entries.push({
-      id: randomUUID(),
-      snapshotId,
-      rank: entries.length + 1,
-      title,
-      author: clean(authorLinks.first().text()) || "未知",
-      genre: "待校对",
-      words: parseCompactNumber(context.match(/[0-9]+(?:\.[0-9]+)?\s*万\s*字/)?.[0] ?? ""),
-      status: /完结|已完本/.test(context) ? "完结" : /连载/.test(context) ? "连载" : "未知",
-      tags: [],
-      sourceUrl: new URL(href, parsedUrl).toString(),
-    });
-  });
-  return entries;
+export function parseAuthorizedRankingCsv(
+  csv: string,
+  listName: string,
+  capturedAt = new Date().toISOString(),
+): RankingSnapshot {
+  if (Buffer.byteLength(csv) > RANKING_CSV_BYTE_LIMIT) throw new Error("CSV 文件超过 5MB 限制");
+  const snapshot = parseRankingCsv(csv, listName, { createId: randomUUID, capturedAt, strict: true });
+  const sourceVersion =
+    snapshot.sourceVersion ??
+    `sha256:${createHash("sha256")
+      .update(csv.replace(/^\uFEFF/, ""))
+      .digest("hex")}`;
+  return { ...snapshot, sourceVersion };
 }
 
 export async function capturePublicRankingPage(url: string, listName: string): Promise<RankingSnapshot> {
   const capturedAt = new Date().toISOString();
-  const snapshotId = randomUUID();
-  let parsedUrl: URL;
+  let source = "授权 CSV";
   try {
-    parsedUrl = new URL(url);
-  } catch {
-    throw new Error("公开页 URL 无效");
-  }
-  if (!/^https?:$/.test(parsedUrl.protocol)) throw new Error("只允许访问 HTTP 或 HTTPS 公开页面");
-  try {
-    const html = await fetchPublicHtml(parsedUrl);
-    const $ = load(html);
-    if (parsedUrl.hostname === "fanqienovel.com" || parsedUrl.hostname.endsWith(".fanqienovel.com")) {
-      const { entries, failures } = await parseFanqieRanking($, parsedUrl, snapshotId);
-      if (!entries.length) throw new Error(`番茄详情元数据采集失败：${failures.join("；")}`);
-      return {
-        id: snapshotId,
-        source: "番茄小说官网",
-        listName,
-        capturedAt,
-        status: failures.length ? "部分成功" : "成功",
-        error: failures.length ? `${failures.length} 本详情采集失败；其余书目已保存` : null,
-        entries,
-      };
-    }
-    const adaptedEntries = parsedUrl.hostname.endsWith("zongheng.com") ? parseZongheng($, parsedUrl, snapshotId) : [];
-    if (adaptedEntries.length)
-      return {
-        id: snapshotId,
-        source: parsedUrl.hostname,
-        listName,
-        capturedAt,
-        status: "成功",
-        error: null,
-        entries: adaptedEntries,
-      };
-    const entries: RankingEntry[] = [];
-    const seen = new Set<string>();
-    $('a[href*="/page/"], a[href*="/reader/"], a[href*="/book/"]').each((_index, element) => {
-      const anchor = $(element);
-      const href = anchor.attr("href") ?? "";
-      const title = clean(anchor.attr("title") || anchor.find("[class*=title]").first().text() || anchor.text());
-      if (!title || title.length > 80 || seen.has(href || title)) return;
-      const container = anchor.closest("li, article, [class*=book], [class*=rank], [class*=item]");
-      const context = (container.length ? container.text() : anchor.parent().text()).replace(/\s+/g, " ").trim();
-      if (context.length < title.length) return;
-      const rankText = container.find("[class*=rank], [class*=index], [class*=order]").first().text();
-      const author =
-        container.find("[class*=author], [class*=writer]").first().text().replace(/\s+/g, " ").trim() || "未知";
-      const wordsText = context.match(/[0-9]+(?:\.[0-9]+)?\s*万?\s*字/)?.[0] ?? "";
-      const status = /完结|已完本/.test(context) ? "完结" : /连载/.test(context) ? "连载" : "未知";
-      seen.add(href || title);
-      entries.push({
-        id: randomUUID(),
-        snapshotId,
-        rank: Number(rankText.match(/\d+/)?.[0]) || entries.length + 1,
-        title,
-        author,
-        genre: "待校对",
-        words: parseCompactNumber(wordsText),
-        status,
-        tags: [],
-        sourceUrl: new URL(href, parsedUrl).toString(),
-      });
-    });
-    if (!entries.length) throw new Error("页面中未识别到公开书目；请改用 CSV 导入或更新页面适配器");
-    return { id: snapshotId, source: parsedUrl.hostname, listName, capturedAt, status: "成功", error: null, entries };
+    const parsedUrl = assertRankingCsvUrl(url);
+    source = `授权 CSV · ${parsedUrl.host}${parsedUrl.pathname}`;
+    const csv = await fetchRankingCsv(parsedUrl);
+    return { ...parseAuthorizedRankingCsv(csv, listName, capturedAt), source };
   } catch (error) {
     return {
-      id: snapshotId,
-      source: parsedUrl.hostname,
+      id: randomUUID(),
+      source,
       listName,
       capturedAt,
       status: "失败",
@@ -456,9 +175,10 @@ export function analyzeRankings(snapshots: RankingSnapshot[]): RankingAnalytics 
   };
   const grouped = new Map<string, RankingSnapshot[]>();
   for (const snapshot of successful) {
-    const list = grouped.get(snapshot.listName) ?? [];
+    const key = JSON.stringify([snapshot.source, snapshot.listName]);
+    const list = grouped.get(key) ?? [];
     list.push(snapshot);
-    grouped.set(snapshot.listName, list);
+    grouped.set(key, list);
   }
   const comparableLists = [...grouped.values()].filter((list) => list.length >= 2);
   const newEntrants = comparableLists.flatMap((list) => {
@@ -479,9 +199,10 @@ export function analyzeRankings(snapshots: RankingSnapshot[]): RankingAnalytics 
     })
     .filter((item) => item.change !== 0)
     .sort((a, b) => Math.abs(b.change) - Math.abs(a.change));
-  const marketOpportunities: MarketOpportunity[] = [...grouped.entries()]
-    .map(([listName, list]) => {
+  const marketOpportunities: MarketOpportunity[] = [...grouped.values()]
+    .map((list) => {
       const latestSnapshot = list.at(-1)!;
+      const { listName, source } = latestSnapshot;
       const previousSnapshot = list.at(-2);
       const latestEntries = latestSnapshot.entries;
       const previousEntries = previousSnapshot?.entries ?? [];
@@ -553,6 +274,7 @@ export function analyzeRankings(snapshots: RankingSnapshot[]): RankingAnalytics 
               : "竞争或动能暂不突出，不建议仅凭单次榜单追热点。";
       return {
         listName,
+        source,
         categoryKey: profile?.key,
         categoryName: profile?.name ?? listName,
         genre: profile?.genre ?? inferredGenre,

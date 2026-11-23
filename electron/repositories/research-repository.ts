@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import type { InsightPack, ResearchAnalysisRecord, ResearchBook } from "../../src/shared/types";
+import type { InsightPack, ResearchAnalysisRecord, ResearchBook, ResearchSelection } from "../../src/shared/types";
 
 const now = () => new Date().toISOString();
 const hashText = (value: string) => createHash("sha256").update(value).digest("hex");
@@ -14,6 +14,27 @@ const textWindows = (text: string, stride: number) => {
 
 export class ResearchRepository {
   constructor(private readonly db: DatabaseSync) {}
+
+  listSelections(): ResearchSelection[] {
+    return (
+      this.db.prepare("SELECT payload FROM research_selections ORDER BY updated_at DESC, id").all() as Array<{
+        payload: string;
+      }>
+    ).map((row) => JSON.parse(row.payload) as ResearchSelection);
+  }
+
+  saveSelection(input: ResearchSelection): ResearchSelection {
+    const row = this.db
+      .prepare(`
+        INSERT INTO research_selections (id, payload, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          payload = json_set(excluded.payload, '$.createdAt', json_extract(research_selections.payload, '$.createdAt')),
+          updated_at = excluded.updated_at
+        RETURNING payload
+      `)
+      .get(input.id, JSON.stringify(input), input.updatedAt) as { payload: string };
+    return JSON.parse(row.payload) as ResearchSelection;
+  }
 
   listBooks(): ResearchBook[] {
     return (

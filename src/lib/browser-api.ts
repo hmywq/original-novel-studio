@@ -25,7 +25,7 @@ import { prepareExpectationSave } from "../shared/expectation-service";
 import { planFactConflictResolution, prepareFactSave } from "../shared/fact-service";
 import { getFanqieCategoryProfile } from "../shared/fanqie-taxonomy";
 import { computeGenerationQuality } from "../shared/generation-quality";
-import { positioningToConceptInput } from "../shared/incubation";
+import { mergeIdeaSeed, positioningToConceptInput } from "../shared/incubation";
 import { analyzeMetrics, parseMetricsCsv } from "../shared/metrics";
 import {
   applyContractRepairs,
@@ -39,7 +39,7 @@ import { COARSE_BLOCK_CHAPTERS } from "../shared/planning";
 import { prepareProjectCreation, prepareProjectUpdate } from "../shared/project-service";
 import { prepareQualityIssueSave, resolveQualityIssue } from "../shared/quality-issue-service";
 import { parseRankingCsv } from "../shared/ranking-csv";
-import { prepareLocalResearchBook } from "../shared/research-import-service";
+import { isResearchSourceUrl, prepareLocalResearchBook, RESEARCH_URL_ERROR } from "../shared/research-import-service";
 import { prepareReviewExperiment } from "../shared/review-experiment-service";
 import { prepareScheduleSave } from "../shared/schedule-service";
 import { prepareStoryEntrySave, seedStoryEntriesFromContract } from "../shared/story-entry-service";
@@ -60,6 +60,7 @@ import type {
   ImportPreview,
   IncubationCandidate,
   InsightPack,
+  InsightPackEdits,
   LedgerFact,
   NovelRevisionApplyResult,
   PlanNode,
@@ -87,6 +88,7 @@ function load(): DemoState {
     state.genDecisions ??= {};
     state.planVersions ??= {};
     state.incubations ??= [];
+    state.researchSelections ??= [];
     for (const project of state.projects) {
       for (const plan of project.plans) {
         state.planVersions[plan.id] ??= plan.status === "已批准" ? 2 : 1;
@@ -305,6 +307,17 @@ export function createBrowserApi(): AppApi {
     async createProject(input: CreateProjectInput) {
       return createProject(input);
     },
+    async createProjectFromTemplate(input) {
+      const { prepareStoryTemplate } = await import("../shared/story-templates");
+      const prepared = prepareStoryTemplate(input, id, now());
+      const created = createProject(prepared.input);
+      const project = getProject(state, created.id);
+      project.contract = { ...project.contract, ...prepared.contract, approved: false };
+      project.plans.push(...prepared.planning.plans);
+      project.chapters.push(...prepared.planning.chapters);
+      persist();
+      return summary(project);
+    },
     async generateBookConcepts(input: BookConceptInput): Promise<IncubationCandidate[]> {
       const ideas = [
         ["她能看见事故留下的断点", "被错误定责的安全调查员，发现每起事故现场都会显露一处可验证的因果断点。"],
@@ -510,7 +523,7 @@ export function createBrowserApi(): AppApi {
       if (draft.createdProjectId) throw new Error("该立项草稿已经创建过作品");
       const concept = draft.candidates.find((item) => item.id === draft.selectedCandidateId);
       if (!concept) throw new Error("请先在立项草稿里选定一套方案");
-      const input = positioningToConceptInput(draft.positioning, draft.seed);
+      const input = positioningToConceptInput(draft.positioning, mergeIdeaSeed(draft.idea, draft.seed));
       const created = createProject({ ...input, title: concept.title });
       const project = getProject(state, created.id);
       applyConceptToProject(project, input, concept);
@@ -783,6 +796,17 @@ export function createBrowserApi(): AppApi {
         }),
         updatedAt,
       });
+      // 检查记录来自本地检查入口，普通正文保存不能写入调用方携带的投影。
+      const priorCheck = previous?.qualityCheck;
+      const reviewInputChanged =
+        previous &&
+        (previous.number !== next.number ||
+          previous.content !== next.content ||
+          !sameRevisionSnapshot(chapterRevisionSnapshot(previous), chapterRevisionSnapshot(next)));
+      next.qualityCheck =
+        priorCheck && reviewInputChanged
+          ? { ...priorCheck, status: "未完成检查", reason: "稿件已修改，请重新运行质检。" }
+          : priorCheck;
       if (existing >= 0) project.chapters[existing] = next;
       else project.chapters.push(next);
       project.summary.updatedAt = updatedAt;
@@ -949,6 +973,14 @@ export function createBrowserApi(): AppApi {
       const plan = prepareQualityIssueSave(project.issues, chapterId, issues);
       for (const issue of plan.upserts) {
         const index = project.issues.findIndex((item) => item.id === issue.id);
+        // 浏览器只做本地规则，不能据此宣布旧的语义硬冲突已解决。
+        if (
+          index >= 0 &&
+          project.issues[index].severity === "硬性" &&
+          project.issues[index].status === "待处理" &&
+          issue.status === "已解决"
+        )
+          continue;
         if (index >= 0) project.issues[index] = issue;
         else project.issues.push(issue);
       }
@@ -961,7 +993,7 @@ export function createBrowserApi(): AppApi {
             previous: chapter,
             forcedStatus: chapter.status === "草稿" ? "待质检" : undefined,
             protectedEdit: false,
-            createRevision: true,
+            createRevision: false,
             chapterId: chapter.id,
             endingExpectationId: chapter.endingExpectationId ?? null,
             batchMode,
@@ -969,9 +1001,22 @@ export function createBrowserApi(): AppApi {
           },
         );
       }
+      const check = {
+        runId: id(),
+        status: "未完成检查" as const,
+        chapterFingerprint: "browser-local-only",
+        inputFingerprint: "browser-local-only",
+        checkedAt: updatedAt,
+        issueIds: project.issues
+          .filter((issue) => issue.chapterId === chapterId && issue.status === "待处理")
+          .map((issue) => issue.id),
+        observations,
+        reason: "浏览器预览仅完成本地规则检查，未运行模型语义与跨章连续性检查；请在桌面版运行质检。",
+      };
+      project.chapters[chapterIndex] = { ...project.chapters[chapterIndex], qualityCheck: check };
       project.summary.updatedAt = updatedAt;
       persist();
-      return { issues, observations };
+      return { issues, observations, check };
     },
     async reviseChapterFromQuality() {
       throw new Error("AI 修订正文需要在桌面版配置模型后使用");
@@ -1113,6 +1158,24 @@ export function createBrowserApi(): AppApi {
     async getRankingAnalytics() {
       return browserRankingAnalytics(state.rankings);
     },
+    async listResearchSelections() {
+      return structuredClone(state.researchSelections).sort(
+        (a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id),
+      );
+    },
+    async saveResearchSelection(input) {
+      const title = input.title.trim();
+      const url = input.url.trim();
+      if (!title) throw new Error("请填写书名");
+      if (!isResearchSourceUrl(url)) throw new Error(RESEARCH_URL_ERROR);
+      const index = state.researchSelections.findIndex((item) => item.id === input.id);
+      const createdAt = state.researchSelections[index]?.createdAt ?? input.createdAt;
+      const next = structuredClone({ ...input, title, url, createdAt });
+      if (index < 0) state.researchSelections.push(next);
+      else state.researchSelections[index] = next;
+      persist();
+      return structuredClone(next);
+    },
     async listResearchBooks() {
       return structuredClone(state.books);
     },
@@ -1139,6 +1202,14 @@ export function createBrowserApi(): AppApi {
       state.insights.unshift(insight);
       persist();
       return insight;
+    },
+    async updateInsight(insightId: string, edits: InsightPackEdits) {
+      const index = state.insights.findIndex((item) => item.id === insightId);
+      if (index < 0) throw new Error("洞察不存在，可能已被移除");
+      const updated = { ...state.insights[index], ...edits };
+      state.insights[index] = updated;
+      persist();
+      return structuredClone(updated);
     },
     async deconstructResearchBook(bookId) {
       const book = state.books.find((item) => item.id === bookId)!;

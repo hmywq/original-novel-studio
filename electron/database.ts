@@ -40,8 +40,10 @@ import type {
   AutoBackupSettings,
   ChangeRequest,
   Chapter,
+  ChapterQualityCheck,
   ChapterSaveMode,
   ChapterStatus,
+  CheckedChapterQualityReview,
   CreateProjectInput,
   ExpectationEntry,
   IncubationDraft,
@@ -61,6 +63,7 @@ import type {
   RankingSnapshot,
   ResearchAnalysisRecord,
   ResearchBook,
+  ResearchSelection,
   ReviewExperiment,
   RevisionRecord,
   ScheduleItem,
@@ -71,6 +74,7 @@ import type {
   SystemHealthReport,
 } from "../src/shared/types";
 import { type ChapterGenerationGuard, chapterGenerationFingerprint } from "./ai-retry";
+import { chapterQualityFingerprint } from "./chapter-quality-fingerprint";
 import { injectFault } from "./fault-injection";
 import { ensureStructure, hasColumn, runMigrations, type StructureSpec } from "./migration-runner";
 import type { AiJobCompletion } from "./repositories/ai-audit-repository";
@@ -233,6 +237,7 @@ export class WorkspaceDatabase {
   private readonly catalog: DatabaseSync;
   private readonly research: DatabaseSync;
   private readonly projectDbs = new Map<string, DatabaseSync>();
+  private readonly activeQualityChecks = new Set<string>();
   private readonly aiAudit: AiAuditRepository;
   private readonly aiProfiles: AiProfileRepository;
   private readonly projects: ProjectRepository;
@@ -409,6 +414,25 @@ export class WorkspaceDatabase {
               db.exec(`ALTER TABLE ranking_entries ADD COLUMN ${column} TEXT`);
         },
       },
+      {
+        id: "research-0003-ranking-evidence",
+        run: (db) => {
+          if (!hasColumn(db, "ranking_snapshots", "source_version"))
+            db.exec("ALTER TABLE ranking_snapshots ADD COLUMN source_version TEXT");
+          if (!hasColumn(db, "ranking_entries", "reader_count"))
+            db.exec("ALTER TABLE ranking_entries ADD COLUMN reader_count INTEGER");
+        },
+      },
+      {
+        id: "research-0004-selections",
+        run: (db) =>
+          db.exec(`
+        CREATE TABLE IF NOT EXISTS research_selections (
+          id TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_research_selections_updated ON research_selections(updated_at DESC, id);
+        `),
+      },
     ]);
   }
 
@@ -525,35 +549,50 @@ export class WorkspaceDatabase {
     return db;
   }
 
-  createProject(input: CreateProjectInput): ProjectSummary {
+  createProject(
+    input: CreateProjectInput,
+    opening?: {
+      contract: Omit<StoryContract, "version" | "approved" | "updatedAt">;
+      planning: PlanningGenerationResult;
+    },
+  ): ProjectSummary {
     const id = randomUUID();
     const timestamp = now();
     const prepared = prepareProjectCreation(input, {
       projectId: id,
       updatedAt: timestamp,
     });
-    this.catalog
-      .prepare(
-        `
+    this.catalog.exec("BEGIN IMMEDIATE");
+    try {
+      this.catalog
+        .prepare(`
       INSERT INTO projects(id, title, genre, status, target_words, words_per_chapter, update_cadence, safe_stock_line, created_at, updated_at)
       VALUES(?, ?, ?, '候选立项', ?, ?, ?, ?, ?, ?)
-    `,
-      )
-      .run(
-        id,
-        prepared.summary.title,
-        prepared.summary.genre,
-        prepared.summary.targetWords,
-        prepared.summary.wordsPerChapter,
-        prepared.summary.updateCadence,
-        prepared.summary.safeStockLine,
-        timestamp,
-        timestamp,
-      );
-    const db = this.projectDb(id);
-    this.setState(db, "contract", prepared.contract);
-    this.setState(db, "insightIds", []);
-    return this.getProjectSummary(id);
+    `)
+        .run(
+          id,
+          prepared.summary.title,
+          prepared.summary.genre,
+          prepared.summary.targetWords,
+          prepared.summary.wordsPerChapter,
+          prepared.summary.updateCadence,
+          prepared.summary.safeStockLine,
+          timestamp,
+          timestamp,
+        );
+      const db = this.projectDb(id);
+      this.setState(db, "contract", { ...prepared.contract, ...opening?.contract, approved: false });
+      this.setState(db, "insightIds", []);
+      if (opening) this.saveLaunchPackBatch(id, opening.planning);
+      const summary = this.getProjectSummary(id);
+      this.catalog.exec("COMMIT");
+      return summary;
+    } catch (error) {
+      this.catalog.exec("ROLLBACK");
+      this.projectDbs.get(id)?.close();
+      this.projectDbs.delete(id);
+      throw error;
+    }
   }
 
   createProjectFromConcept(
@@ -814,7 +853,7 @@ export class WorkspaceDatabase {
       summary: this.getProjectSummary(id),
       contract: this.getState<StoryContract>(db, "contract"),
       plans: this.listRecords<PlanNode>(db, "plans").sort((a, b) => a.ordinal - b.ordinal),
-      chapters: this.projects.listChapters(db),
+      chapters: this.projects.listChapters(db).map((chapter) => this.projectChapterQuality(db, chapter)),
       facts: this.listRecords<LedgerFact>(db, "facts").sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
       issues: this.listRecords<QualityIssue>(db, "issues").sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
       changes: this.listRecords<ChangeRequest>(db, "changes").sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
@@ -843,7 +882,7 @@ export class WorkspaceDatabase {
       summary: this.getProjectSummary(id),
       contract: this.getState<StoryContract>(db, "contract"),
       plans: this.listRecords<PlanNode>(db, "plans").sort((a, b) => a.ordinal - b.ordinal),
-      chapters: this.projects.listChapterMetadata(db),
+      chapters: this.projects.listChapterMetadata(db).map((chapter) => this.projectChapterQuality(db, chapter, false)),
       facts: this.listRecords<LedgerFact>(db, "facts").sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
       issues: this.listRecords<QualityIssue>(db, "issues").sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
       changes: this.listRecords<ChangeRequest>(db, "changes").sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
@@ -869,7 +908,75 @@ export class WorkspaceDatabase {
   getChapter(id: string, chapterId: string): Chapter {
     const chapter = this.projects.getChapter(this.projectDb(id), chapterId);
     if (!chapter) throw new Error("章节不存在");
-    return chapter;
+    return this.projectChapterQuality(this.projectDb(id), chapter);
+  }
+
+  private projectChapterQuality(db: DatabaseSync, chapter: Chapter, verifyContent = true): Chapter {
+    const { qualityCheck: _untrustedProjection, ...saved } = chapter;
+    const check = this.getRecord<ChapterQualityCheck>(db, "chapter_quality_checks", chapter.id);
+    if (!check) return saved;
+    const stale = verifyContent && check.chapterFingerprint !== chapterQualityFingerprint(chapter);
+    const interrupted = check.status === "检查中" && !this.activeQualityChecks.has(check.runId);
+    return {
+      ...saved,
+      qualityCheck:
+        stale || interrupted
+          ? {
+              ...check,
+              status: "未完成检查",
+              reason: stale ? "稿件已变化，请重新检查" : "上次检查已中断，请手动重新检查",
+            }
+          : check,
+    };
+  }
+
+  beginChapterQualityCheck(projectId: string, chapterId: string, check: ChapterQualityCheck): void {
+    const db = this.projectDb(projectId);
+    if (!this.projects.getChapter(db, chapterId)) throw new Error("章节不存在");
+    this.projects.saveRecord(db, "chapter_quality_checks", chapterId, check, undefined, false);
+    this.activeQualityChecks.add(check.runId);
+  }
+
+  /** Atomically binds issues and review status to the exact saved chapter and run. */
+  saveChapterQualityReview(
+    projectId: string,
+    chapterId: string,
+    expectedRunId: string,
+    expectedChapterFingerprint: string,
+    result: CheckedChapterQualityReview,
+  ): boolean {
+    const db = this.projectDb(projectId);
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      const chapter = this.projects.getChapter(db, chapterId);
+      const current = this.getRecord<ChapterQualityCheck>(db, "chapter_quality_checks", chapterId);
+      if (
+        !chapter ||
+        current?.runId !== expectedRunId ||
+        chapterQualityFingerprint(chapter) !== expectedChapterFingerprint
+      ) {
+        db.exec("ROLLBACK");
+        this.activeQualityChecks.delete(expectedRunId);
+        return false;
+      }
+      const complete = result.check.status === "已通过" || result.check.status === "有冲突";
+      this.saveIssuesInTransaction(db, chapterId, result.issues, complete);
+      this.projects.saveRecord(db, "chapter_quality_checks", chapterId, result.check, undefined, false);
+      if (chapter.status === "草稿") db.prepare("UPDATE chapters SET status = ? WHERE id = ?").run("待质检", chapterId);
+      injectFault("power-loss-before-commit");
+      db.exec("COMMIT");
+      this.activeQualityChecks.delete(expectedRunId);
+      this.touchProject(projectId);
+      return true;
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        /* transaction already closed */
+      }
+      this.activeQualityChecks.delete(expectedRunId);
+      throw error;
+    }
   }
 
   saveLaunchPackProgress(id: string, progress: LaunchPackProgress): LaunchPackProgress {
@@ -1125,7 +1232,7 @@ export class WorkspaceDatabase {
         !PROTECTED_CHAPTER_STATUSES.includes(saved.status)
       )
         this.updateSummaries(id, saved);
-      return saved;
+      return this.projectChapterQuality(db, saved);
     } catch (error) {
       try {
         db.exec("ROLLBACK");
@@ -1145,6 +1252,9 @@ export class WorkspaceDatabase {
     expected?: ChapterGenerationGuard,
     changeRequestId?: string,
   ) {
+    // Review metadata belongs to records, never to a renderer-provided chapter payload.
+    const { qualityCheck: _qualityProjection, ...editableChapter } = chapter;
+    chapter = editableChapter;
     const previous = chapter.id ? this.projects.getChapter(db, chapter.id) : undefined;
     if (
       expected &&
@@ -1214,6 +1324,16 @@ export class WorkspaceDatabase {
         this.saveRecord(db, "schedule", schedule.id, { ...schedule, status: "待排期" });
     }
     this.projects.saveChapter(db, next, previous?.revision, createRevision);
+    const quality = this.getRecord<ChapterQualityCheck>(db, "chapter_quality_checks", next.id);
+    if (quality && quality.chapterFingerprint !== chapterQualityFingerprint(next))
+      this.projects.saveRecord(
+        db,
+        "chapter_quality_checks",
+        next.id,
+        { ...quality, status: "未完成检查", reason: "稿件已变化，请重新检查" },
+        undefined,
+        false,
+      );
     db.prepare("DELETE FROM chapter_fts WHERE id = ?").run(next.id);
     db.prepare("INSERT INTO chapter_fts(id, title, content) VALUES(?, ?, ?)").run(next.id, next.title, next.content);
     db.prepare("DELETE FROM chapter_fts_tri WHERE id = ?").run(next.id);
@@ -1520,15 +1640,7 @@ export class WorkspaceDatabase {
     const db = this.projectDb(id);
     db.exec("BEGIN IMMEDIATE");
     try {
-      const plan = prepareQualityIssueSave(this.listRecords<QualityIssue>(db, "issues"), chapterId, issues);
-      for (const issue of plan.upserts) this.saveRecord(db, "issues", issue.id, issue);
-      if (plan.forceSequentialReview) {
-        // 逐章复核是工作流派生标记，不是用户内容修改：直接改列，
-        // 不走受保护内容门禁（否则一次质检会消耗变更单，或整批质检结果回滚）。
-        const chapter = this.projects.getChapter(db, chapterId);
-        if (chapter && chapter.batchMode !== "逐章")
-          db.prepare("UPDATE chapters SET batch_mode = ? WHERE id = ?").run("逐章", chapterId);
-      }
+      this.saveIssuesInTransaction(db, chapterId, issues, true);
       injectFault("power-loss-before-commit");
       db.exec("COMMIT");
       this.touchProject(id);
@@ -1539,6 +1651,22 @@ export class WorkspaceDatabase {
         /* transaction already closed */
       }
       throw error;
+    }
+  }
+
+  private saveIssuesInTransaction(
+    db: DatabaseSync,
+    chapterId: string,
+    issues: QualityIssue[],
+    complete: boolean,
+  ): void {
+    const existing = this.listRecords<QualityIssue>(db, "issues");
+    const plan = prepareQualityIssueSave(complete ? existing : [], chapterId, issues);
+    for (const issue of plan.upserts) this.saveRecord(db, "issues", issue.id, issue);
+    if (plan.forceSequentialReview) {
+      const chapter = this.projects.getChapter(db, chapterId);
+      if (chapter && chapter.batchMode !== "逐章")
+        db.prepare("UPDATE chapters SET batch_mode = ? WHERE id = ?").run("逐章", chapterId);
     }
   }
 
@@ -1638,9 +1766,9 @@ export class WorkspaceDatabase {
   }
 
   listRankings(): RankingSnapshot[] {
-    const rows = this.research.prepare("SELECT * FROM ranking_snapshots ORDER BY captured_at DESC").all() as Array<
-      Record<string, unknown>
-    >;
+    const rows = this.research
+      .prepare("SELECT * FROM ranking_snapshots ORDER BY captured_at DESC, rowid DESC")
+      .all() as Array<Record<string, unknown>>;
     return rows.map((row) => ({
       id: String(row.id),
       source: String(row.source),
@@ -1648,6 +1776,7 @@ export class WorkspaceDatabase {
       capturedAt: String(row.captured_at),
       status: row.status as RankingSnapshot["status"],
       error: row.error ? String(row.error) : null,
+      sourceVersion: row.source_version == null ? undefined : String(row.source_version),
       entries: (
         this.research
           .prepare("SELECT * FROM ranking_entries WHERE snapshot_id = ? ORDER BY rank")
@@ -1666,6 +1795,7 @@ export class WorkspaceDatabase {
         synopsis: entry.synopsis ? String(entry.synopsis) : undefined,
         officialReaderUrl: entry.official_reader_url ? String(entry.official_reader_url) : undefined,
         platform: entry.platform ? String(entry.platform) : undefined,
+        readerCount: entry.reader_count == null ? undefined : Number(entry.reader_count),
       })),
     }));
   }
@@ -1674,13 +1804,23 @@ export class WorkspaceDatabase {
     this.research.exec("BEGIN IMMEDIATE");
     try {
       this.research
-        .prepare("INSERT INTO ranking_snapshots VALUES(?, ?, ?, ?, ?, ?)")
-        .run(snapshot.id, snapshot.source, snapshot.listName, snapshot.capturedAt, snapshot.status, snapshot.error);
+        .prepare(
+          "INSERT INTO ranking_snapshots(id, source, list_name, captured_at, status, error, source_version) VALUES(?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(
+          snapshot.id,
+          snapshot.source,
+          snapshot.listName,
+          snapshot.capturedAt,
+          snapshot.status,
+          snapshot.error,
+          snapshot.sourceVersion ?? null,
+        );
       const insert = this.research.prepare(
         `INSERT INTO ranking_entries(
         id, snapshot_id, rank, title, author, genre, words, status, tags, source_url,
-        synopsis, official_reader_url, platform
-      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        synopsis, official_reader_url, platform, reader_count
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       for (const entry of snapshot.entries)
         insert.run(
@@ -1697,6 +1837,7 @@ export class WorkspaceDatabase {
           entry.synopsis ?? null,
           entry.officialReaderUrl ?? null,
           entry.platform ?? null,
+          entry.readerCount ?? null,
         );
       injectFault("power-loss-before-commit");
       this.research.exec("COMMIT");
@@ -1725,6 +1866,14 @@ export class WorkspaceDatabase {
 
   deleteRankingSchedule(id: string) {
     this.setSetting("ranking.schedules", JSON.stringify(this.listRankingSchedules().filter((item) => item.id !== id)));
+  }
+
+  listResearchSelections(): ResearchSelection[] {
+    return this.researchData.listSelections();
+  }
+
+  saveResearchSelection(input: ResearchSelection): ResearchSelection {
+    return this.researchData.saveSelection(input);
   }
 
   listResearchBooks(): ResearchBook[] {

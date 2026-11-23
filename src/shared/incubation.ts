@@ -28,6 +28,19 @@ export function candidateCountForPath(path: IncubationPath) {
 export const INCUBATION_STATUSES = ["孵化中", "已立项", "已放弃"] as const;
 export type IncubationStatus = (typeof INCUBATION_STATUSES)[number];
 
+export const IDEA_SOURCES = ["自己的脑洞", "生活观察", "市场线索", "发散练习"] as const;
+
+export interface IdeaRecord {
+  title: string;
+  original: string;
+  keep: string;
+  source: (typeof IDEA_SOURCES)[number];
+  reference: string;
+  referenceUrl?: string;
+  tags: string[];
+  parentId?: string;
+}
+
 export interface IncubationPositioning {
   genre: Genre;
   fanqieCategoryKey: string;
@@ -66,6 +79,7 @@ export interface IncubationDraft {
   step: IncubationStep;
   /** 旧草稿缺省视为探索路径。 */
   path?: IncubationPath;
+  idea?: IdeaRecord;
   positioning: IncubationPositioning;
   evidence: IncubationEvidenceRefs;
   seed: string;
@@ -120,6 +134,21 @@ export function positioningToConceptInput(
     safeStockLine: positioning.safeStockLine,
     seed,
   };
+}
+
+export function mergeIdeaSeed(idea: IdeaRecord | undefined, revised: string) {
+  if (!idea) return revised;
+  const pieces = [`原始脑洞\n${idea.original}`];
+  if (idea.keep) pieces.push(`作者指定必须保留\n${idea.keep}`);
+  const extra = revised.trim();
+  if (extra && extra !== idea.original) pieces.push(`作者追加的方向\n${extra.slice(0, 2200)}`);
+  return pieces.join("\n\n");
+}
+
+export function ideaEvidenceNotes(idea: IdeaRecord | undefined, notes: string[]) {
+  const source =
+    idea?.source === "市场线索" && idea.reference ? `作者选用的市场线索：${idea.reference.slice(0, 460)}` : "";
+  return Array.from(new Set([source, ...notes].filter(Boolean))).slice(0, 20);
 }
 
 export function missingIncubationFields(positioning: IncubationPositioning) {

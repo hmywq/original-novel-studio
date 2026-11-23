@@ -203,6 +203,7 @@ describe("project handlers", () => {
       "attachInsights",
       "createProject",
       "createProjectFromConcept",
+      "createProjectFromTemplate",
       "decideChangeRequest",
       "deleteIncubation",
       "deleteProject",

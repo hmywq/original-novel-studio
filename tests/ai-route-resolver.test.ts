@@ -50,7 +50,27 @@ describe("AI 来源路由", () => {
     expect(roleForTask("deconstruct-batch")).toBe("extract");
     expect(roleForTask("extract-chapter-facts")).toBe("extract");
     expect(roleForTask("connection-test")).toBe("utility");
+    expect(roleForTask("generate-book-concepts")).toBe("concept");
+    expect(roleForTask("generate-book-concepts-diversity-retry")).toBe("concept");
     expect(roleForTask("generate-chapter-plans")).toBe("plan");
+  });
+
+  it("选题生成和章纲使用独立模型路由", () => {
+    const resolve = createAiRouteResolver({
+      database: fakeDatabase({
+        profiles: [profile({ id: "p-main" })],
+        defaultId: "p-main",
+        routes: [
+          { role: "concept", profileId: "p-main", modelId: "idea-model" },
+          { role: "plan", profileId: "p-main", modelId: "outline-model" },
+        ],
+      }),
+      getCredential: () => "k",
+    });
+
+    expect(resolve(roleForTask("generate-book-concepts"))).toMatchObject({ model: "idea-model" });
+    expect(resolve(roleForTask("generate-chapter-plans"))).toMatchObject({ model: "outline-model" });
+    expect(roleForTask("deconstruct-batch")).toBe("extract");
   });
 
   it("没有配置来源时返回 null，调用方回落到旧版设置", () => {

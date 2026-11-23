@@ -1,9 +1,12 @@
+import { randomUUID } from "node:crypto";
 import { aggregateCategoryTags } from "../../src/shared/category-tags";
 import { missingContractApprovalFields } from "../../src/shared/contract-service";
 import { assembleDashboard, localDayEndExclusive } from "../../src/shared/dashboard-policy";
 import { getFanqieCategoryProfile } from "../../src/shared/fanqie-taxonomy";
-import { positioningToConceptInput } from "../../src/shared/incubation";
+import { ideaEvidenceNotes, mergeIdeaSeed, positioningToConceptInput } from "../../src/shared/incubation";
 import { analyzeMetrics, parseMetricsCsv } from "../../src/shared/metrics";
+import { prepareStoryTemplate } from "../../src/shared/story-templates";
+import { isStudioFormat } from "../../src/shared/studio-format";
 import type {
   BookConceptInput,
   BookConceptSkeleton,
@@ -113,6 +116,9 @@ function contractDraftFromConcept(
     ending: concept.ending,
     immutableRules: concept.immutableRules,
     prohibitedPatterns: concept.prohibitedPatterns,
+    ...(isStudioFormat(input.lengthShape) && (input.seed?.trim() || input.commercialBoundary?.trim())
+      ? { creativeBrief: [input.seed, input.commercialBoundary].filter(Boolean).join("\n").slice(0, 2000) }
+      : {}),
   };
 }
 
@@ -342,6 +348,10 @@ export function registerProjectHandlers({
   );
   register("listProjects", () => database.listProjects());
   register("createProject", (input) => database.createProject(input));
+  register("createProjectFromTemplate", (input) => {
+    const prepared = prepareStoryTemplate(input, randomUUID, currentDate().toISOString());
+    return database.createProject(prepared.input, { contract: prepared.contract, planning: prepared.planning });
+  });
   register("generateBookConcepts", (input) =>
     ai.generateBookConcepts(
       input,
@@ -361,6 +371,7 @@ export function registerProjectHandlers({
       },
       contractDraftFromConcept(input, concept, skeleton),
     );
+    if (input.evidenceInsightIds?.length) database.attachInsights(project.id, input.evidenceInsightIds);
     startLaunchPack(project.id);
     return project;
   });
@@ -381,7 +392,10 @@ export function registerProjectHandlers({
     if (draft.createdProjectId) throw new Error("该立项草稿已经创建过作品");
     const concept = draft.candidates.find((item) => item.id === draft.selectedCandidateId);
     if (!concept) throw new Error("请先在立项草稿里选定一套方案");
-    const input = positioningToConceptInput(draft.positioning, draft.seed);
+    const input = positioningToConceptInput(draft.positioning, mergeIdeaSeed(draft.idea, draft.seed), {
+      insightIds: draft.evidence.insightIds,
+      notes: ideaEvidenceNotes(draft.idea, draft.evidence.marketOpportunityKeys),
+    });
     const skeleton = await ai.expandBookConcept(input, concept);
     const project = database.createProjectFromConcept(
       {
@@ -394,6 +408,7 @@ export function registerProjectHandlers({
       },
       contractDraftFromConcept(input, concept, skeleton),
     );
+    if (input.evidenceInsightIds?.length) database.attachInsights(project.id, input.evidenceInsightIds);
     database.markIncubationPromoted(draftId, project.id, currentDate().toISOString());
     startLaunchPack(project.id);
     return project;

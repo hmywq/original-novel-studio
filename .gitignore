@@ -10,6 +10,21 @@ playwright-report/
 *.log
 .DS_Store
 
+# Local application data and caches
+.workspace/
+.local-profile/
+.local-cache/
+/.tmp/
+/output/
+/资料库/
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.novelbak
+
 # Codex desktop metadata
 .reasonix/
 

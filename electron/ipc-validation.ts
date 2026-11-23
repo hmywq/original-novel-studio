@@ -1,7 +1,10 @@
 import { z } from "zod";
 import { NARRATIVE_GENRES } from "../src/shared/genre-composition";
+import { isResearchSourceUrl, RESEARCH_URL_ERROR } from "../src/shared/research-import-service";
 import type { AppApi } from "../src/shared/types";
 import { CHAPTER_FUNCTIONS, GENRES, NOVEL_CONTRACT_FIELDS } from "../src/shared/types";
+import { isRankingInboxSource, parseRankingInboxFilename } from "./ranking-inbox";
+import { assertRankingCsvUrl, RANKING_CSV_BYTE_LIMIT } from "./ranking-service";
 
 const id = z
   .string()
@@ -26,6 +29,18 @@ const httpUrl = z
     const url = new URL(value);
     return !url.username && !url.password;
   }, "地址不能包含用户名或密码");
+const rankingSource = z
+  .string()
+  .trim()
+  .max(2000)
+  .superRefine((source, context) => {
+    try {
+      if (isRankingInboxSource(source)) parseRankingInboxFilename(source);
+      else assertRankingCsvUrl(source);
+    } catch (error) {
+      context.addIssue({ code: "custom", message: error instanceof Error ? error.message : "榜单来源无效" });
+    }
+  });
 const modelBaseUrl = httpUrl
   .refine((value) => new URL(value).protocol === "https:", "模型 API 地址必须使用 HTTPS")
   .refine((value) => {
@@ -166,6 +181,19 @@ const incubationDraft = z
     status: z.enum(["孵化中", "已立项", "已放弃"]),
     step: z.enum(["定位", "证据", "候选", "体检", "骨架", "开书包"]),
     path: z.enum(["探索", "定向", "直达"]).optional(),
+    idea: z
+      .object({
+        title: z.string().trim().min(1).max(80),
+        original: z.string().trim().min(1).max(1600),
+        keep: z.string().max(600),
+        source: z.enum(["自己的脑洞", "生活观察", "市场线索", "发散练习"]),
+        reference: z.string().max(600),
+        referenceUrl: httpUrl.optional(),
+        tags: z.array(z.string().trim().min(1).max(24)).max(6),
+        parentId: id.optional(),
+      })
+      .strict()
+      .optional(),
     positioning: incubationPositioning,
     evidence: z
       .object({
@@ -513,6 +541,24 @@ const reviewExperiment = z
       context.addIssue({ code: "custom", message: "结束实验必须填写结论和处理决定", path: ["conclusion"] });
   });
 
+const researchSourceUrl = z.string().trim().max(2000).refine(isResearchSourceUrl, RESEARCH_URL_ERROR);
+
+const researchSelection = z
+  .object({
+    id,
+    platformId: id,
+    title: z.string().trim().min(1).max(500),
+    author: z.string().trim().max(500),
+    url: researchSourceUrl,
+    note: z.string().trim().max(10_000),
+    tags: z.array(z.string().trim().min(1).max(80)).max(20),
+    kind: z.string().trim().max(200),
+    status: z.enum(["待阅读", "已阅读", "搁置"]),
+    createdAt: z.iso.datetime(),
+    updatedAt: z.iso.datetime(),
+  })
+  .strict();
+
 const importPreview = z
   .object({
     fileName: z.string().max(1000),
@@ -531,6 +577,15 @@ const importPreview = z
       .max(10_000),
     totalWords: z.number().int().min(0).max(50_000_000),
     warnings: z.array(shortText).max(1000),
+    reference: z
+      .object({
+        title: z.string().trim().max(500),
+        author: z.string().trim().max(500),
+        url: researchSourceUrl,
+        platform: z.string().trim().max(200),
+      })
+      .strict()
+      .optional(),
   })
   .strict()
   .superRefine((value, context) => {
@@ -552,6 +607,22 @@ const insightInput = z
     marketGap: mediumText,
     risks: mediumText,
     evidenceCount: z.number().int().min(0).max(10_000_000),
+    confidence: z.enum(["低", "中", "高"]),
+  })
+  .strict();
+
+const insightEdits = z
+  .object({
+    name: shortText,
+    genre,
+    audienceNeed: mediumText,
+    openingPromise: mediumText,
+    conflictEngine: mediumText,
+    emotionalRhythm: mediumText,
+    retentionDevices: mediumText,
+    longFormEngine: mediumText,
+    marketGap: mediumText,
+    risks: mediumText,
     confidence: z.enum(["低", "中", "高"]),
   })
   .strict();
@@ -600,6 +671,16 @@ const schemas = {
   getDashboard: noArgs,
   listProjects: noArgs,
   createProject: z.tuple([createProject]),
+  createProjectFromTemplate: z.tuple([
+    z
+      .object({
+        templateId: z.string().min(1).max(60),
+        title: z.string().max(100).optional(),
+        protagonistName: z.string().max(30).optional(),
+        targetWords: z.number().int().min(10000).max(10000000).optional(),
+      })
+      .strict(),
+  ]),
   generateBookConcepts: z.tuple([bookConceptInput]),
   createProjectFromConcept: z.tuple([bookConceptInput, bookConcept]),
   listIncubations: noArgs,
@@ -758,13 +839,13 @@ const schemas = {
       .strict(),
   ]),
   listRankings: noArgs,
-  importRankingCsv: z.tuple([z.string().max(20_000_000), z.string().trim().min(1).max(200)]),
-  capturePublicRanking: z.tuple([httpUrl, z.string().trim().min(1).max(200)]),
+  importRankingCsv: z.tuple([z.string().max(RANKING_CSV_BYTE_LIMIT), z.string().trim().min(1).max(200)]),
+  capturePublicRanking: z.tuple([rankingSource, z.string().trim().min(1).max(200)]),
   saveRankingSchedule: z.tuple([
     z
       .object({
         id: z.string().max(200).optional(),
-        url: httpUrl,
+        url: rankingSource,
         listName: z.string().trim().min(1).max(200),
         frequency: z.enum(["每日", "每周"]),
         enabled: z.boolean(),
@@ -775,18 +856,21 @@ const schemas = {
   runRankingSchedule: idOnly,
   deleteRankingSchedule: idOnly,
   getRankingAnalytics: noArgs,
+  listResearchSelections: noArgs,
+  saveResearchSelection: z.tuple([researchSelection]),
   listResearchBooks: noArgs,
   previewResearchFile: noArgs,
   importResearchBook: z.tuple([importPreview, genre, z.boolean(), z.boolean()]),
   importPublicResearchSample: z.tuple([httpUrl, genre, z.boolean()]),
   listInsights: noArgs,
   createInsight: z.tuple([insightInput]),
+  updateInsight: z.tuple([id, insightEdits]),
   deconstructResearchBook: idOnly,
   listResearchAnalyses: idOnly,
   attachInsights: z.tuple([id, z.array(id).max(1000)]),
   generateConcepts: idOnly,
   generateChapterDraft: z.tuple([id, id, id.optional(), taskModelOverride.optional()]),
-  previewChapterBatch: projectEntity,
+  previewChapterBatch: z.tuple([id, id, taskModelOverride.optional()]),
   generateChapterBatch: z.tuple([id, id, taskModelOverride.optional()]),
   getAiSettings: noArgs,
   testAiConnection: z.tuple([taskModelOverride.optional()]),

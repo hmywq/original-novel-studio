@@ -1,6 +1,6 @@
 import { AlertTriangle, Trash2 } from "lucide-react";
 import { Badge, IconButton } from "../components/UI";
-import { CONTEXT_SECTION_LABELS } from "../shared/context-diagnostics";
+import { CONTEXT_SECTION_LABELS, type ContextContentKey } from "../shared/context-diagnostics";
 import { CONTEXT_BAND_SHORT } from "../shared/context-layout";
 import { TOKEN_ESTIMATE_WARNING } from "../shared/token-estimator";
 import type { ContextPackage } from "../shared/types";
@@ -54,9 +54,10 @@ export function ContextPanel({ context, onClose }: { context: ContextPackage; on
           </div>
         </div>
       )}
-      {Object.entries(context)
-        .filter(([key]) => key !== "estimatedTokens" && key !== "diagnostics")
-        .map(([key, value]) => (
+      {(Object.keys(CONTEXT_SECTION_LABELS) as ContextContentKey[]).map((key) => {
+        const text = context[key];
+        if (text === undefined) return null;
+        return (
           <details
             key={key}
             open={
@@ -66,10 +67,11 @@ export function ContextPanel({ context, onClose }: { context: ContextPackage; on
               key === "forbiddenKnowledge"
             }
           >
-            <summary>{CONTEXT_SECTION_LABELS[key as keyof typeof CONTEXT_SECTION_LABELS]}</summary>
-            <pre>{value || "无"}</pre>
+            <summary>{CONTEXT_SECTION_LABELS[key]}</summary>
+            <pre>{text || "无"}</pre>
           </details>
-        ))}
+        );
+      })}
     </aside>
   );
 }

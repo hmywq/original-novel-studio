@@ -33,8 +33,14 @@ export function ResearchBooksView({
                   <Badge>{book.genre}</Badge>
                   <h3>{book.title}</h3>
                   <p>
+                    {book.sourcePlatform && `${book.sourcePlatform} · `}
                     {book.sourceType} · {book.chapterCount} 章 · {formatCount(book.wordCount)}字
                   </p>
+                  {book.sourceUrl && (
+                    <a href={book.sourceUrl} target="_blank" rel="noreferrer">
+                      打开出处
+                    </a>
+                  )}
                 </div>
                 <div className={styles.bookConsents}>
                   <span>

@@ -1,3 +1,4 @@
+import type { ModelPricing } from "./ai/types";
 import { hasMajorStateChange } from "./major-state-change";
 import { volumeBoundaryChapters } from "./planning";
 import { evaluateStoryConstraints } from "./story-constraints";
@@ -7,18 +8,34 @@ import type { AiSettings, BatchGenerationPreview, Chapter, ProjectDetail } from 
 type ChapterBatchProject = Pick<ProjectDetail, "summary" | "contract" | "plans" | "chapters" | "facts" | "issues">;
 
 type ChapterBatchPricing = Pick<AiSettings, "inputPricePerMillion" | "outputPricePerMillion">;
+export const QUALITY_REVIEW_ESTIMATED_OUTPUT_TOKENS = 2_000;
+export interface ChapterReviewEstimate {
+  inputTokens: number;
+  outputTokens: number;
+  pricing: ModelPricing | null;
+}
+export interface ChapterBatchEstimateOptions {
+  estimateReview: (chapter: Chapter) => ChapterReviewEstimate;
+  canReuseQuality?: (chapter: Chapter) => boolean;
+  draftPricing?: ModelPricing | null;
+}
 
 export function buildChapterBatchPreview(
   project: ChapterBatchProject,
   settings: ChapterBatchPricing,
   chapterId: string,
   estimateInputTokens: (chapter: Chapter) => number,
+  options?: ChapterBatchEstimateOptions,
 ): BatchGenerationPreview {
   const blocked = (reason: string, chapters: BatchGenerationPreview["chapters"] = []): BatchGenerationPreview => ({
     chapters,
     inputTokens: 0,
     outputTokens: 0,
     estimatedCost: 0,
+    reviewCalls: 0,
+    reviewInputTokens: 0,
+    reviewOutputTokens: 0,
+    costEstimateComplete: true,
     canRun: false,
     blockingReason: reason,
   });
@@ -67,18 +84,56 @@ export function buildChapterBatchPreview(
     }
   }
 
-  const inputTokens = ordered.reduce((sum, chapter) => sum + estimateInputTokens(chapter), 0);
-  const outputTokens = ordered.reduce(
+  for (const chapter of ordered) {
+    if (chapter.content.trim() && !options?.canReuseQuality?.(chapter))
+      return blocked(`第${chapter.number}章已有正文，请先手动检查并处理硬性问题后继续批次`, chapterSummaries);
+  }
+  const pending = ordered.filter((chapter) => !chapter.content.trim());
+  const draftInputTokens = pending.reduce((sum, chapter) => sum + estimateInputTokens(chapter), 0);
+  const draftOutputTokens = pending.reduce(
     (sum, chapter) => sum + estimateChapterOutputTokens(chapter.targetWords ?? 2300),
+    0,
+  );
+  const reviews = pending.map(
+    (chapter) =>
+      options?.estimateReview(chapter) ?? {
+        inputTokens: estimateInputTokens(chapter) + estimateChapterOutputTokens(chapter.targetWords ?? 2300),
+        outputTokens: QUALITY_REVIEW_ESTIMATED_OUTPUT_TOKENS,
+        pricing: null,
+      },
+  );
+  const reviewInputTokens = reviews.reduce((sum, review) => sum + review.inputTokens, 0);
+  const reviewOutputTokens = reviews.reduce((sum, review) => sum + review.outputTokens, 0);
+  const draftPricing =
+    options && "draftPricing" in options
+      ? options.draftPricing
+      : {
+          inputPerMillion: settings.inputPricePerMillion,
+          outputPerMillion: settings.outputPricePerMillion,
+        };
+  const costEstimateComplete = !pending.length || Boolean(draftPricing && reviews.every((review) => review.pricing));
+  const draftCost = draftPricing
+    ? (draftInputTokens * draftPricing.inputPerMillion + draftOutputTokens * draftPricing.outputPerMillion) / 1_000_000
+    : 0;
+  const reviewCost = reviews.reduce(
+    (sum, review) =>
+      sum +
+      (review.pricing
+        ? (review.inputTokens * review.pricing.inputPerMillion +
+            review.outputTokens * review.pricing.outputPerMillion) /
+          1_000_000
+        : 0),
     0,
   );
   return {
     chapters: chapterSummaries,
-    inputTokens,
-    outputTokens,
-    estimatedCost:
-      (inputTokens / 1_000_000) * (settings.inputPricePerMillion ?? 0) +
-      (outputTokens / 1_000_000) * (settings.outputPricePerMillion ?? 0),
+    inputTokens: draftInputTokens + reviewInputTokens,
+    outputTokens: draftOutputTokens + reviewOutputTokens,
+    reviewCalls: reviews.length,
+    reviewInputTokens,
+    reviewOutputTokens,
+    costEstimateComplete,
+    estimatedCost: costEstimateComplete ? draftCost + reviewCost : null,
     canRun: true,
     blockingReason: null,
   };

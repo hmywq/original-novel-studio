@@ -195,6 +195,43 @@ describe("context compiler", () => {
     expect(context.recentSummary).not.toContain("这是不应注入的正文");
   });
 
+  it("carries bounded draft evidence separately from confirmed settings without future text", () => {
+    const context = compileChapterContext(
+      input({
+        recentChapters: [
+          chapter(9, { content: "唐晖已经退清租灯预付款，封条放入证物袋。" }),
+          chapter(11, { content: "尚未进行的交接" }),
+        ],
+        relevantFacts: [
+          fact("confirmed"),
+          fact("unreviewed", { confidence: "待确认" }),
+          fact("future-source", { evidenceChapter: 11 }),
+        ],
+      }),
+    );
+    expect(context.continuity).toContain("唐晖已经退清租灯预付款");
+    expect(context.continuity).toContain("待审前文");
+    expect(context.continuity).not.toContain("尚未进行的交接");
+    expect(context.continuitySources?.some((source) => source.id === "fact:confirmed")).toBe(true);
+    expect(context.continuitySources?.some((source) => source.id === "fact:unreviewed")).toBe(false);
+    expect(context.relevantFacts).not.toContain("future-source");
+    expect(context.diagnostics?.sections.find((section) => section.key === "continuity")?.source).toContain("前文");
+  });
+
+  it("drops source metadata with trimmed model sections rather than validating unseen evidence", () => {
+    const context = compileChapterContext(
+      input({ recentChapters: [chapter(9, { content: "柜上的封条已经剪断。".repeat(200) })] }),
+      { budgetTokens: 550, windowTokens: 2000 },
+    );
+    const rendered = Object.values(context)
+      .filter((value): value is string => typeof value === "string")
+      .join("\n");
+    for (const source of context.continuitySources ?? []) expect(rendered).toContain(source.text);
+    if (!context.continuity) expect(context.continuitySources?.some((source) => source.kind === "前文")).toBe(false);
+    if (!context.relevantFacts)
+      expect(context.continuitySources?.some((source) => source.kind === "已确认事实")).toBe(false);
+  });
+
   it("selects approved plans, active facts and prior chapters deterministically", () => {
     const context = compileChapterContext(input());
     expect(context.rollingOutline).toContain("approved");

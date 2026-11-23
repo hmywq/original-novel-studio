@@ -7,6 +7,7 @@ export interface AiFlavorHit {
   count: number;
   perThousand: number;
   positions: number[];
+  ranges: Array<{ start: number; end: number }>;
 }
 
 export interface AiFlavorReport {
@@ -113,7 +114,7 @@ function evaluateFeature(
   whitelist: readonly NormalizedRange[],
   scale: number,
 ): AiFlavorHit | null {
-  const positions: number[] = [];
+  const ranges: AiFlavorHit["ranges"] = [];
   if (feature.isRegExp) {
     const regex = compileFeature(feature);
     if (!regex) return null;
@@ -121,24 +122,27 @@ function evaluateFeature(
       const index = match.index;
       const matched = match[0];
       if (typeof index !== "number" || matched.length === 0) continue;
-      if (!intersects(whitelist, index, index + matched.length)) positions.push(index);
+      const end = index + matched.length;
+      if (!intersects(whitelist, index, end)) ranges.push({ start: index, end });
     }
   } else {
     if (!feature.pattern) return null;
     let index = text.indexOf(feature.pattern);
     while (index !== -1) {
-      if (!intersects(whitelist, index, index + feature.pattern.length)) positions.push(index);
-      index = text.indexOf(feature.pattern, index + feature.pattern.length);
+      const end = index + feature.pattern.length;
+      if (!intersects(whitelist, index, end)) ranges.push({ start: index, end });
+      index = text.indexOf(feature.pattern, end);
     }
   }
-  if (positions.length === 0) return null;
+  if (ranges.length === 0) return null;
   return {
     featureId: feature.id,
     label: feature.label,
     severity: feature.severity,
-    count: positions.length,
-    perThousand: scale > 0 ? positions.length / scale : 0,
-    positions,
+    count: ranges.length,
+    perThousand: scale > 0 ? ranges.length / scale : 0,
+    positions: ranges.map((range) => range.start),
+    ranges,
   };
 }
 
@@ -208,6 +212,7 @@ export function mergeAiFlavorReports(reports: readonly AiFlavorReport[]): AiFlav
       perThousand: scale > 0 ? total.count / scale : 0,
       // 跨章节合并后偏移量不再指向同一段文本，位置一律清空。
       positions: [],
+      ranges: [],
     };
   });
   return { characters, hits, ...summarizeHits(hits, characters) };

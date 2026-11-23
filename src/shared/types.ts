@@ -8,6 +8,7 @@ import type {
   TaskModelOverride,
 } from "./ai/types";
 import type { CategoryTagStat } from "./category-tags";
+import type { ContinuitySource } from "./chapter-continuity";
 import type { GenerationQuality } from "./generation-quality";
 import type { GenreComposition, NarrativeGenre } from "./genre-composition";
 import type { IncubationDraft } from "./incubation";
@@ -99,6 +100,7 @@ export interface RankingEntry {
   synopsis?: string;
   officialReaderUrl?: string;
   platform?: string;
+  readerCount?: number;
 }
 
 export interface RankingSnapshot {
@@ -109,6 +111,7 @@ export interface RankingSnapshot {
   status: "成功" | "部分成功" | "失败";
   error: string | null;
   entries: RankingEntry[];
+  sourceVersion?: string;
 }
 
 export interface RankingCaptureSchedule {
@@ -139,6 +142,7 @@ export interface RankingAnalytics {
 
 export interface MarketOpportunity {
   listName: string;
+  source?: string;
   categoryKey?: string;
   categoryName: string;
   genre: Genre | "待校对";
@@ -159,6 +163,20 @@ export interface MarketOpportunity {
   recommendation: string;
 }
 
+export interface ResearchSelection {
+  id: string;
+  platformId: string;
+  title: string;
+  author: string;
+  url: string;
+  note: string;
+  tags: string[];
+  kind: string;
+  status: "待阅读" | "已阅读" | "搁置";
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface ResearchBook {
   id: string;
   title: string;
@@ -166,6 +184,7 @@ export interface ResearchBook {
   genre: Genre;
   sourceType: "TXT" | "EPUB" | "DOCX" | "粘贴" | "公开试读";
   sourceUrl?: string;
+  sourcePlatform?: string;
   sampleScope?: string;
   chapterCount: number;
   wordCount: number;
@@ -203,6 +222,21 @@ export interface InsightPack {
   confidence: "低" | "中" | "高";
   createdAt: string;
 }
+
+export type InsightPackEdits = Pick<
+  InsightPack,
+  | "name"
+  | "genre"
+  | "audienceNeed"
+  | "openingPromise"
+  | "conflictEngine"
+  | "emotionalRhythm"
+  | "retentionDevices"
+  | "longFormEngine"
+  | "marketGap"
+  | "risks"
+  | "confidence"
+>;
 
 export interface AestheticProfile {
   narrativeDistance: "贴身" | "适中" | "远距";
@@ -290,6 +324,8 @@ export interface Chapter {
   linkedExpectationIds?: string[];
   revision: number;
   updatedAt: string;
+  /** 主进程只读投影；普通章节保存不能写入或恢复检查结论。 */
+  qualityCheck?: ChapterQualityCheck;
 }
 
 export type ExpectationStatus = "待兑现" | "部分兑现" | "已兑现" | "已放弃";
@@ -370,6 +406,25 @@ export interface QualityIssue {
   evidence: string;
   status: "待处理" | "已忽略" | "已解决";
   createdAt: string;
+  continuityEvidence?: ContinuityEvidence;
+}
+
+export interface ContinuityEvidence {
+  sourceId: string;
+  previousQuote: string;
+  currentQuote: string;
+  conflictKind: "身份" | "日期" | "状态" | "动作" | "视角";
+}
+
+export interface ChapterQualityCheck {
+  runId: string;
+  status: "检查中" | "已通过" | "有冲突" | "未完成检查";
+  chapterFingerprint: string;
+  inputFingerprint: string;
+  checkedAt: string | null;
+  issueIds: string[];
+  observations: string[];
+  reason: string | null;
 }
 
 export interface ChapterQualityReview {
@@ -377,6 +432,10 @@ export interface ChapterQualityReview {
   issues: QualityIssue[];
   /** 统计观察：只展示，不生成问题、不驱动改稿。 */
   observations: string[];
+}
+
+export interface CheckedChapterQualityReview extends ChapterQualityReview {
+  check: ChapterQualityCheck;
 }
 
 /** 成对比较：同一裁判对两个版本换序各判一次。 */
@@ -762,9 +821,13 @@ export interface ImportPreview {
   chapters: Array<{ title: string; content: string; wordCount: number }>;
   totalWords: number;
   warnings: string[];
+  reference?: { title: string; author: string; url: string; platform: string };
 }
 
 export interface ContextPackage {
+  continuity?: string;
+  /** 仅供本地引用校验，不重复发送给模型。 */
+  continuitySources?: ContinuitySource[];
   contract: string;
   commercialGuidance: string;
   chapterIntent: string;
@@ -780,6 +843,7 @@ export interface ContextPackage {
   authorStyle: string;
   /** 本次上下文使用的创作自由度档位；缺省按均衡处理，用于推导写作温度。 */
   guidanceMode?: GuidanceMode;
+  studio?: { format: import("./studio-format").StudioFormat; targetChapters: number };
   estimatedTokens: number;
   diagnostics?: ContextDiagnostics;
 }
@@ -788,7 +852,7 @@ export interface ContextPackage {
 export type ContextBand = "stable" | "slow" | "fast" | "task";
 
 export interface ContextSectionDiagnostic {
-  key: Exclude<keyof ContextPackage, "estimatedTokens" | "diagnostics">;
+  key: Exclude<keyof ContextPackage, "estimatedTokens" | "diagnostics" | "studio" | "continuitySources">;
   label: string;
   source: string;
   reason: string;
@@ -816,9 +880,20 @@ export interface BatchGenerationPreview {
   chapters: Array<{ id: string; number: number; title: string }>;
   inputTokens: number;
   outputTokens: number;
-  estimatedCost: number;
+  estimatedCost: number | null;
+  reviewCalls: number;
+  reviewInputTokens: number;
+  reviewOutputTokens: number;
+  costEstimateComplete: boolean;
   canRun: boolean;
   blockingReason: string | null;
+}
+
+export interface ChapterBatchGenerationResult {
+  chapters: Chapter[];
+  status: "completed" | "paused";
+  stoppedAtChapter: number | null;
+  reason: string | null;
 }
 
 export type PlanningGenerationMode = "全书结构" | "全书粗纲" | "后续章纲";
@@ -1138,6 +1213,7 @@ export interface AppApi {
   getDashboard(): Promise<DashboardData>;
   listProjects(): Promise<ProjectSummary[]>;
   createProject(input: CreateProjectInput): Promise<ProjectSummary>;
+  createProjectFromTemplate(input: import("./story-template-type").StoryTemplateInput): Promise<ProjectSummary>;
   generateBookConcepts(input: BookConceptInput): Promise<IncubationCandidate[]>;
   createProjectFromConcept(input: BookConceptInput, concept: IncubationCandidate): Promise<ProjectSummary>;
   listIncubations(): Promise<IncubationDraft[]>;
@@ -1183,7 +1259,7 @@ export interface AppApi {
   searchProject(id: string, query: string, offset?: number, limit?: number): Promise<SearchHit[]>;
   listRevisions(id: string, collection: RevisionRecord["collection"], entityId: string): Promise<RevisionRecord[]>;
   restoreRevision(id: string, revisionId: string): Promise<void>;
-  runQualityCheck(id: string, chapterId: string, override?: TaskModelOverride): Promise<ChapterQualityReview>;
+  runQualityCheck(id: string, chapterId: string, override?: TaskModelOverride): Promise<CheckedChapterQualityReview>;
   judgeChapterDrafts(
     id: string,
     input: ChapterPairwiseInput,
@@ -1213,6 +1289,8 @@ export interface AppApi {
   runRankingSchedule(id: string): Promise<RankingSnapshot>;
   deleteRankingSchedule(id: string): Promise<void>;
   getRankingAnalytics(): Promise<RankingAnalytics>;
+  listResearchSelections(): Promise<ResearchSelection[]>;
+  saveResearchSelection(input: ResearchSelection): Promise<ResearchSelection>;
   listResearchBooks(): Promise<ResearchBook[]>;
   previewResearchFile(): Promise<ImportPreview | null>;
   importResearchBook(
@@ -1224,6 +1302,7 @@ export interface AppApi {
   importPublicResearchSample(sourceUrl: string, genre: Genre, cloudConsent: boolean): Promise<ResearchBook>;
   listInsights(): Promise<InsightPack[]>;
   createInsight(input: Omit<InsightPack, "id" | "createdAt">): Promise<InsightPack>;
+  updateInsight(id: string, edits: InsightPackEdits): Promise<InsightPack>;
   deconstructResearchBook(bookId: string): Promise<InsightPack>;
   listResearchAnalyses(bookId: string): Promise<ResearchAnalysisRecord[]>;
   attachInsights(id: string, insightIds: string[]): Promise<void>;
@@ -1234,8 +1313,12 @@ export interface AppApi {
     onStream?: (event: ChapterDraftStreamEvent) => void,
     override?: TaskModelOverride,
   ): Promise<Chapter>;
-  previewChapterBatch(id: string, chapterId: string): Promise<BatchGenerationPreview>;
-  generateChapterBatch(id: string, chapterId: string, override?: TaskModelOverride): Promise<Chapter[]>;
+  previewChapterBatch(id: string, chapterId: string, override?: TaskModelOverride): Promise<BatchGenerationPreview>;
+  generateChapterBatch(
+    id: string,
+    chapterId: string,
+    override?: TaskModelOverride,
+  ): Promise<ChapterBatchGenerationResult>;
   getAiSettings(): Promise<AiSettings>;
   testAiConnection(override?: TaskModelOverride): Promise<{ ok: boolean; message: string }>;
   saveAiSettings(settings: Omit<AiSettings, "hasApiKey">, apiKey?: string): Promise<AiSettings>;

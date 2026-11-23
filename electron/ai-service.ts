@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { compileAestheticGuidance } from "../src/shared/aesthetic-profile";
+import { lookupCatalog } from "../src/shared/ai/catalog";
 import { toStrictJsonSchema } from "../src/shared/ai/strict-json-schema";
-import type { ApiSurface, ModelRole, TaskModelOverride } from "../src/shared/ai/types";
+import type { ApiSurface, ModelPricing, ModelRole, TaskModelOverride } from "../src/shared/ai/types";
+import { validateContinuityEvidence } from "../src/shared/chapter-continuity";
 import {
   compileCommercialGuidance,
   compileDeconstructionFramework,
@@ -34,7 +36,9 @@ const PRIOR_CHAPTER_LIMIT = 20;
 
 import { PROMPT_VERSION } from "../src/shared/prompt-version";
 import { parseStoryNumber } from "../src/shared/story-constraints";
+import { studioPromptsFor } from "../src/shared/studio-prompts";
 import { buildLongTermMemory } from "../src/shared/summaries";
+import { estimateStructuredRequestTokens } from "../src/shared/token-estimator";
 import type {
   AestheticProfileSuggestion,
   BookConceptInput,
@@ -169,8 +173,11 @@ export class AiService {
   }
 
   /** 当前任务角色的上下文窗口与 token 预算；未知窗口按来源类型取默认值。 */
-  contextBudget(role: ModelRole = "draft"): { windowTokens: number; budgetTokens: number } {
-    const route = this.resolveRoute?.(role) ?? null;
+  contextBudget(
+    role: ModelRole = "draft",
+    override?: TaskModelOverride,
+  ): { windowTokens: number; budgetTokens: number } {
+    const route = this.resolveRoute?.(role, override) ?? null;
     const windowTokens = resolveContextWindow({
       contextWindow: route?.contextWindow,
       localEndpoint: route?.localEndpoint,
@@ -181,6 +188,18 @@ export class AiService {
         ...(route?.maxOutputTokens ? { outputReserveTokens: route.maxOutputTokens } : {}),
       }),
     };
+  }
+
+  /** Local quotes only. A different review route must never inherit the draft model's price. */
+  modelPricing(role: ModelRole, override?: TaskModelOverride): ModelPricing | null {
+    const route = this.resolveRoute?.(role, override) ?? null;
+    if (route) return lookupCatalog(route.model)?.pricing ?? null;
+    const settings = this.database.getAiSettings();
+    return Number.isFinite(settings.inputPricePerMillion) &&
+      Number.isFinite(settings.outputPricePerMillion) &&
+      (settings.inputPricePerMillion > 0 || settings.outputPricePerMillion > 0)
+      ? { inputPerMillion: settings.inputPricePerMillion, outputPerMillion: settings.outputPricePerMillion }
+      : null;
   }
 
   private async runJson<T>(options: {
@@ -198,6 +217,7 @@ export class AiService {
     onAttempt?: (attempt: number) => void;
     onDelta?: (delta: string, attempt: number) => void;
     cachePolicy?: AiCachePolicy;
+    maxOutputTokens?: number;
     onJobStarted?: (jobId: string) => void;
     onCacheHit?: () => void;
     /** 写作任务的创作自由度档位，用于推导采样温度。 */
@@ -208,6 +228,7 @@ export class AiService {
     role?: ModelRole;
     /** 单次覆盖来源/模型，只对本次请求生效。 */
     override?: TaskModelOverride;
+    attemptPolicy?: "default" | "single";
   }): Promise<T> {
     const settings = this.database.getAiSettings();
     const role = options.role ?? roleForTask(options.taskType);
@@ -301,7 +322,8 @@ export class AiService {
     // A saved setting is the author's global preference; task defaults only
     // apply to older workspaces that have no persisted preference.
     const reasoningEffort = settings.reasoningEffort ?? options.reasoningEffort ?? "medium";
-    const maxOutputTokens = options.taskType === "draft-chapter" ? 16_000 : options.longTask ? 12_000 : 8_000;
+    const maxOutputTokens =
+      options.maxOutputTokens ?? (options.taskType === "draft-chapter" ? 16_000 : options.longTask ? 12_000 : 8_000);
     let requestMaxTokens = maxOutputTokens;
     const draftTemperature = () =>
       typeof settings.temperatureOverride === "number"
@@ -513,6 +535,7 @@ export class AiService {
         } catch (error) {
           if (error instanceof ProviderHttpError) {
             const { status, detail } = error;
+            if (options.attemptPolicy === "single") throw providerError(status, detail);
             if (useResponses && rejectsResponsesApi(status, detail)) {
               this.log("warn", "ai.request.compatibility_retry", {
                 jobId,
@@ -661,6 +684,7 @@ export class AiService {
           }
           throw new Error(`${lastError}；请降低本章目标字数，或改用输出上限更大的模型。`);
         }
+        if (options.attemptPolicy === "single") break;
         const transient = lastCode === "PROVIDER_UNAVAILABLE" || lastError.startsWith("模型服务暂时不可用");
         if (transient && attempt < 2) {
           try {
@@ -981,6 +1005,8 @@ export class AiService {
 
   async generateBookConcepts(input: BookConceptInput, insights: InsightPack[] = []): Promise<IncubationCandidate[]> {
     const plugin = GENRE_PLUGINS[input.genre];
+    const studio = studioPromptsFor(input.lengthShape);
+    const isShortStory = input.lengthShape === "万字短篇";
     const category = getFanqieCategoryProfile(input.fanqieCategoryKey);
     const subGenreOptions = input.fanqieCategoryKey ? listFanqieSubGenres(input.fanqieCategoryKey) : [];
     const allowDebtAccounting = authorRequestsDebtAccounting(input);
@@ -990,20 +1016,24 @@ export class AiService {
     const count = Math.min(3, Math.max(1, input.candidateCount ?? 3));
     const countLabel = count === 1 ? "一套" : count === 2 ? "两套" : "三套";
     const diversityBrief =
-      count >= 3
-        ? "各案要在主角身份、核心矛盾、关系结构、开局触发、成长载体、主要回报和长篇发动机中至少有四项实质不同，避免共享同一套升级换皮结构。"
-        : count === 2
-          ? "两案要在核心矛盾、开局触发、成长载体和主要回报中至少两项实质不同，不要只换名字。"
-          : "作者已经带来明确想法，只产出一套可直接立项的方案，必须忠实体现作者灵感中的核心设定（人物、处境、情绪与边界），不得替换成通用套路。";
+      studio && count > 1
+        ? `保留作者要保留的设定。各案在分型、开场选择、能力或成长载体、核心回报、首章钩子和升级路径中至少有 ${count >= 3 ? 4 : 2} 项实质不同。`
+        : count >= 3
+          ? "各案要在主角身份、核心矛盾、关系结构、开局触发、成长载体、主要回报和长篇发动机中至少有四项实质不同，避免共享同一套升级换皮结构。"
+          : count === 2
+            ? "两案要在核心矛盾、开局触发、成长载体和主要回报中至少两项实质不同，不要只换名字。"
+            : "作者已经带来明确想法，只产出一套可直接立项的方案，必须忠实体现作者灵感中的核心设定（人物、处境、情绪与边界），不得替换成通用套路。";
     const seedFidelity =
       count < 3 && input.seed.trim()
         ? "每个方案都必须体现作者灵感中的核心设定，不得把它替换成通用开局或通用身份。"
         : "";
-    const payoffWindow = resolveStructurePreset({
-      categoryKey: input.fanqieCategoryKey,
-      wordsPerChapter: input.wordsPerChapter,
-    }).firstPayoffWindow;
-    const system = `你是面向番茄小说的原创商业网文总编。为作者提供${countLabel}可立项方案。${diversityBrief}${seedFidelity}genreSubtype 分别概括每条不同路线，用词差异要对应真实差异。书名应清楚传达题材、身份反差或核心看点，并避开已有作品、热榜书名和独特设定。结局要明确主线如何收束，而不是开放式占位语。
+    const payoffWindow = isShortStory
+      ? [1, 2]
+      : resolveStructurePreset({
+          categoryKey: input.fanqieCategoryKey,
+          wordsPerChapter: input.wordsPerChapter,
+        }).firstPayoffWindow;
+    const system = `你是${studio?.conceptRole ?? "面向番茄小说的原创商业网文总编"}。为作者提供${countLabel}可立项方案。${diversityBrief}${seedFidelity}genreSubtype 分别概括每条不同路线，用词差异要对应真实差异。书名应清楚传达题材、身份反差或核心看点，并避开已有作品、热榜书名和独特设定。结局要明确主线如何收束，而不是开放式占位语。
 每个方案还必须给出：
 - titleOptions：3–5 个书名候选，每个含标题、为什么这样起名、建议标签。
 - openingDesign：首章钩子（谁在什么处境下做了什么选择、立刻产生什么后果）、前三章向读者承诺什么、首个实质回报落在第几章、2–4 个追读锚点。
@@ -1011,8 +1041,18 @@ export class AiService {
 - sustainability：最容易疲劳的位置与换挡方案。
 - differentiation：与同类常见套路的三点差异、原创风险、风险说明。
 - suggestedTags：读者会用来搜索这本书的标签。
-首章钩子必须具体到事件与选择，不得使用"命运、宿命、觉醒、神秘力量"这类空泛表述；首个回报章必须落在所选分类的建议窗口内。${defaultMotifBoundary}`;
-    const baseUser = `平台主题材：${input.genre}\n番茄分类：${category ? `${category.channel}·${category.name}` : "未指定"}\n定位卡：${compilePositioningCard(input)}\n复合叙事类型：${input.secondaryGenres?.join(" + ") || `未指定。每个方案必须从这些叙事主轴中选择互不相同的主轴：${NARRATIVE_GENRES.join("、")}`}\n题材元素：${input.genreElements?.join("、") || "未指定；不得默认使用系统、重生、血脉、退婚或宗门等常见开局"}\n自定义创作方向：${input.customGenreDirection?.trim() || "未指定"}\n目标字数：${input.targetWords}\n单章目标字数：${input.wordsPerChapter ?? 2500}\n首个实质回报必须落在第 ${payoffWindow[0]}–${payoffWindow[1]} 章\n更新节奏：${input.updateCadence}\n作者灵感（可为空）：${input.seed.trim() || "无，请从题材规则独立原创"}\n可参考子类型（只作素材，不是固定答案；genreSubtype 可以原创）：${plugin.subtypes.map((item) => item.name).join("、")}\n可选题材母题（不得默认全部采用，也不得直接复述为方案卖点）：${plugin.coreFantasies.join("；")}\n目标读者：${plugin.targetAudience.join("；")}\n题材禁忌：${plugin.tabooBoundaries.join("；")}\n商业规则：${compileCommercialGuidance(input.genre, 1, { currentWords: 0, targetWords: input.targetWords, fanqieCategoryKey: input.fanqieCategoryKey, secondaryGenres: input.secondaryGenres, genreElements: input.genreElements, customGenreDirection: input.customGenreDirection })}\n${subGenreOptions.length ? `可选二级流派（最多选 2 个，id 必须来自此列表）：${subGenreOptions.map((item) => `${item.id}=${item.name}`).join("、")}` : "二级流派：无"}${insights.length ? `\n脱敏市场洞察（只作读者需求证据，不得复述或模仿任何具体作品）：${JSON.stringify(insights)}` : ""}\n输出 candidates，严格${count}项。fanqieCategoryKey 必须等于「${input.fanqieCategoryKey ?? ""}」；subGenreIds 只能从上面列表里选，最多两个。先在内部为每个方案分别确定叙事主轴、开局机制、成长载体和主要回报，确认差异达标后再输出；不要把内部检查过程写入结果。若作者指定了复合类型，每个方案的 secondaryGenres 都必须包含作者所选类型，但各方案仍须采用不同的冲突切入和长篇扩张方式。每项包含 title、premise、genreSubtype、secondaryGenres、genreElements、openingMechanism、growthCarrier、primaryPayoff、protagonistDesire、readerPromise、coreEmotion、ending、immutableRules、prohibitedPatterns、audience、commercialHook、longFormEngine，以及 fanqieCategoryKey、subGenreIds、titleOptions、openingDesign、escalationLadder、sustainability、differentiation、suggestedTags。secondaryGenres 必须使用给定的叙事主轴枚举。长篇发动机需说明至少三轮冲突与回报升级；所有方案是原创草案，不引用或模仿具体作品。`;
+首章钩子必须具体到事件与选择，不得使用"命运、宿命、觉醒、神秘力量"这类空泛表述；首个回报章必须落在${isShortStory ? "给定的前两节窗口" : "所选分类的建议窗口"}内。${defaultMotifBoundary}${studio ? `\n${studio.concept}` : ""}`;
+    const commercialReference = isShortStory
+      ? `题材核心承诺（参考作者选择）：${plugin.readerPromise}。按独立短篇收束尺度设计。`
+      : compileCommercialGuidance(input.genre, 1, {
+          currentWords: 0,
+          targetWords: input.targetWords,
+          fanqieCategoryKey: input.fanqieCategoryKey,
+          secondaryGenres: input.secondaryGenres,
+          genreElements: input.genreElements,
+          customGenreDirection: input.customGenreDirection,
+        });
+    const baseUser = `平台主题材：${input.genre}\n${isShortStory ? "题材分类参考" : "番茄分类"}：${category ? `${category.channel}·${category.name}` : "未指定"}\n定位卡：${compilePositioningCard(input)}\n复合叙事类型：${input.secondaryGenres?.join(" + ") || `未指定。每个方案必须从这些叙事主轴中选择互不相同的主轴：${NARRATIVE_GENRES.join("、")}`}\n题材元素：${input.genreElements?.join("、") || "未指定；不得默认使用系统、重生、血脉、退婚或宗门等常见开局"}\n自定义创作方向：${input.customGenreDirection?.trim() || "未指定"}\n目标字数：${input.targetWords}\n单章目标字数：${input.wordsPerChapter ?? 2500}\n首个实质回报必须落在第 ${payoffWindow[0]}–${payoffWindow[1]} 章\n更新节奏：${input.updateCadence}\n作者灵感（可为空）：${input.seed.trim() || "无，请从题材规则独立原创"}${studio && input.commercialBoundary?.trim() ? `\n作者明确要保留的内容：${input.commercialBoundary.trim()}` : ""}\n可参考子类型（只作素材，不是固定答案；genreSubtype 可以原创）：${plugin.subtypes.map((item) => item.name).join("、")}\n可选题材母题（不得默认全部采用，也不得直接复述为方案卖点）：${plugin.coreFantasies.join("；")}\n目标读者：${plugin.targetAudience.join("；")}\n题材禁忌：${plugin.tabooBoundaries.join("；")}\n商业规则：${commercialReference}\n${subGenreOptions.length ? `可选二级流派（最多选 2 个，id 必须来自此列表）：${subGenreOptions.map((item) => `${item.id}=${item.name}`).join("、")}` : "二级流派：无"}${insights.length ? `\n脱敏市场洞察（只作读者需求证据，不得复述或模仿任何具体作品）：${JSON.stringify(insights)}` : ""}\n输出 candidates，严格${count}项。fanqieCategoryKey 必须等于「${input.fanqieCategoryKey ?? ""}」；subGenreIds 只能从上面列表里选，最多两个。先在内部为每个方案分别确定叙事主轴、开局机制、成长载体和主要回报，确认差异达标后再输出；不要把内部检查过程写入结果。若作者指定了复合类型，每个方案的 secondaryGenres 都必须包含作者所选类型，但各方案仍须采用不同的冲突切入和${isShortStory ? "解决方式" : "长篇扩张方式"}。每项包含 title、premise、genreSubtype、secondaryGenres、genreElements、openingMechanism、growthCarrier、primaryPayoff、protagonistDesire、readerPromise、coreEmotion、ending、immutableRules、prohibitedPatterns、audience、commercialHook、longFormEngine，以及 fanqieCategoryKey、subGenreIds、titleOptions、openingDesign、escalationLadder、sustainability、differentiation、suggestedTags。secondaryGenres 必须使用给定的叙事主轴枚举。${isShortStory ? "longFormEngine 说明同一主线上的行动、后果和终局如何闭合；" : "长篇发动机需说明至少三轮冲突与回报升级；"}所有方案是原创草案，不引用或模仿具体作品。`;
     const run = (retryIssues?: string[]) =>
       this.runJson({
         projectId: null,
@@ -1058,6 +1098,7 @@ export class AiService {
   }
 
   async expandBookConcept(input: BookConceptInput, concept: IncubationCandidate): Promise<BookConceptSkeleton> {
+    const studio = studioPromptsFor(input.lengthShape);
     const defaultMotifBoundary = authorRequestsDebtAccounting(input)
       ? ""
       : "作者没有选择债务或账目题材，不得在扩展时新增欠债、欠款、讨债、清账、旧账、账本或清算等冲突与隐喻。";
@@ -1067,7 +1108,7 @@ export class AiService {
       taskType: "expand-book-concept-skeleton",
       inputSummary: `${concept.title} 完整世界观与人物档案`,
       system: [
-        "你是中文长篇小说的故事架构师。作者已经选定方向，请替作者完成可直接支撑全书规划的世界观、人物档案、关系网络、势力和时间线。按本书篇幅与叙事需要充分展开，给出完整设定而非留待作者补填的骨架。",
+        `你是中文${studio ? "" : "长篇"}小说的故事架构师。作者已经选定方向，请替作者完成可直接支撑全书规划的世界观、人物档案、关系网络、势力和时间线。按本书篇幅与叙事需要充分展开，给出完整设定而非留待作者补填的骨架。`,
         "保持已确定的主角、核心矛盾、开局机制、成长载体、主要回报、长篇发动机和终局；系统、重生、血脉等元素只有在作者已经选择时才加入。",
         defaultMotifBoundary,
         "主角弧光必须写清起点认知、阶段转变、关键代价和终局状态。关键关系必须说明双方、初始张力、各自目标和不可替代作用。",
@@ -1076,6 +1117,7 @@ export class AiService {
         "世界规则必须是会影响人物选择的职业、社会、能力、资源或超自然规则，并写清边界或代价。主要势力必须说明目标、资源和与主线的冲突位置。",
         "时间锚点必须覆盖开局前因、开局触发、至少一个中期不可逆节点和终局兑现，使用相对阶段，不要编造具体公历日期。",
         "各项要能直接进入故事圣经，不写空泛的‘关系逐渐加深、世界更加广阔、经历重重困难’。",
+        ...(studio ? [studio.skeleton] : []),
       ].join("\n"),
       user: `平台主题材：${input.genre}\n目标字数：${input.targetWords}\n单章目标字数：${input.wordsPerChapter ?? 2500}\n作者完整定位与灵感：${JSON.stringify(input)}\n复合叙事类型：${concept.secondaryGenres.join(" + ")}\n题材元素：${concept.genreElements.join("、") || "无固定元素"}\n自定义方向：${input.customGenreDirection?.trim() || "无"}\n已选开书方案：${JSON.stringify(concept)}\n输出 protagonistArc、keyRelationships、worldRules、majorForces、timelineAnchors，以及 genreSpecificSections。通用栏目为人物档案、地理与日常秩序、主线与伏笔，并补充本书题材专属栏目：${sections.map((item) => `${item.label}（${item.hint}）`).join("；") || "无"}。条目数量按本书需要展开，人物、地点与势力统一命名，所有内容共同支撑从开篇到终局的 longFormEngine。`,
       schema: BookConceptSkeletonSchema,
@@ -1120,6 +1162,7 @@ export class AiService {
     const summaryCharacters = scaledCap(8_000, 1_500, effectiveBudget);
     const wordsPerChapter = project.summary.wordsPerChapter || 2500;
     const targetChapters = Math.ceil(project.summary.targetWords / wordsPerChapter);
+    const studio = studioPromptsFor(project.contract.lengthShape);
     const visiblePlans = project.plans.filter((plan) => includeDraftPlans || plan.status === "已批准");
     const structuralPlans = visiblePlans
       .filter((plan) => plan.kind === "宏观阶段" || plan.kind === "分卷")
@@ -1151,7 +1194,10 @@ export class AiService {
       `目标字数：${project.summary.targetWords}`,
       `预计全书章节：${targetChapters}`,
       `创作契约${project.contract.approved ? "（已审批）" : "（待作者确认的草稿）"}：${JSON.stringify(project.contract)}`,
-      `商业规则：${compileCommercialGuidance(project.summary.genre, startChapter, { currentWords: project.summary.currentWords, targetWords: project.summary.targetWords, subtype: project.contract.genreSubtype, fanqieCategoryKey: project.contract.fanqieCategoryKey, secondaryGenres: project.contract.secondaryGenres, genreElements: project.contract.genreElements, customGenreDirection: project.contract.customGenreDirection, storyStage: resolveStoryStage(project.plans, project.summary.currentWords) })}`,
+      ...(studio ? [studio.planning] : []),
+      project.contract.lengthShape === "万字短篇"
+        ? `题材承诺参考：${GENRE_PLUGINS[project.summary.genre].readerPromise}`
+        : `商业规则：${compileCommercialGuidance(project.summary.genre, startChapter, { currentWords: project.summary.currentWords, targetWords: project.summary.targetWords, subtype: project.contract.genreSubtype, fanqieCategoryKey: project.contract.fanqieCategoryKey, secondaryGenres: project.contract.secondaryGenres, genreElements: project.contract.genreElements, customGenreDirection: project.contract.customGenreDirection, storyStage: resolveStoryStage(project.plans, project.summary.currentWords) })}`,
       `全书结构（宏观阶段与分卷${includeDraftPlans ? "，含待确认草稿" : ""}）：${JSON.stringify(structuralPlans.map((plan) => ({ kind: plan.kind, title: plan.title, ordinal: plan.ordinal, targetWords: plan.targetWords, goal: plan.goal, conflict: plan.conflict, outcome: plan.outcome })))}`,
       currentRange
         ? `当前卷（第${currentRange.fromChapter}–${currentRange.toChapter}章）：${JSON.stringify({ title: currentRange.plan.title, goal: currentRange.plan.goal, conflict: currentRange.plan.conflict, outcome: currentRange.plan.outcome, targetWords: currentRange.plan.targetWords })}`
@@ -1214,6 +1260,9 @@ export class AiService {
       wordsPerChapter: project.summary.wordsPerChapter,
     });
     const targetChapters = Math.ceil(project.summary.targetWords / (project.summary.wordsPerChapter || 2500));
+    const studio = studioPromptsFor(project.contract.lengthShape);
+    if (studio && input.mode !== "全书结构" && startChapter > targetChapters)
+      throw new Error(`已到本书终局（第${targetChapters}章）。请调整篇幅或审核现有规划。`);
     const shared = this.planningContext(project, startChapter, includeDraftPlans, structure, contextScale);
     if (input.mode === "全书粗纲") {
       const chapterCount = Math.max(
@@ -1223,27 +1272,40 @@ export class AiService {
       const blockStarts: number[] = [];
       for (let number = startChapter; number < startChapter + chapterCount; number += COARSE_BLOCK_CHAPTERS)
         blockStarts.push(number);
+      const blockEnd = (start: number) => start + COARSE_BLOCK_CHAPTERS - 1;
+      const actualEnd = (start: number) => Math.min(blockEnd(start), startChapter + chapterCount - 1);
       const result = await this.runJson({
         projectId: project.summary.id,
         taskType: "generate-coarse-plan",
         override,
         inputSummary: `${project.summary.title} 第${startChapter}–${startChapter + chapterCount - 1}章粗纲`,
-        system:
-          "你是中国商业网文总编。按每十章一个批次给出全书粗纲，只写批次的推进目标、主要矛盾和结果变化，不写章节目录、不写场景。批次之间必须因果承接，并服务于当前分卷目标；结果变化要能成为下一批次的起点。",
-        user: `${shared}\n从第${startChapter}章开始，严格输出 ${blockStarts.length} 个 blocks，fromChapter 依次为 ${blockStarts.join("、")}，每个批次覆盖 10 章。`,
+        system: studio
+          ? "你是中文小说编辑。按给定章节范围写批次粗纲，交代推进目标、人物选择、主要矛盾和结果变化。批次因果承接，最后一批完整收束。"
+          : "你是中国商业网文总编。按每十章一个批次给出全书粗纲，只写批次的推进目标、主要矛盾和结果变化，不写章节目录、不写场景。批次之间必须因果承接，并服务于当前分卷目标；结果变化要能成为下一批次的起点。",
+        user: studio
+          ? `${shared}\n严格输出 ${blockStarts.length} 个 blocks，fromChapter 依次为 ${blockStarts.join("、")}。各批覆盖：${blockStarts.map((start) => `第${start}–${actualEnd(start)}章`).join("、")}。`
+          : `${shared}\n从第${startChapter}章开始，严格输出 ${blockStarts.length} 个 blocks，fromChapter 依次为 ${blockStarts.join("、")}，每个批次覆盖 10 章。`,
         schema: CoarsePlanningSchema,
         longTask: true,
         stream: true,
       });
+      if (
+        studio &&
+        (result.blocks.length !== blockStarts.length ||
+          result.blocks.some((block, index) => block.fromChapter !== blockStarts[index]))
+      )
+        throw new Error("模型返回的粗纲范围与本次选定的章节不一致，请重试");
       const plans: PlanNode[] = result.blocks.map((block) => ({
         id: randomUUID(),
         kind: "粗纲" as const,
-        title: `第${block.fromChapter}–${block.fromChapter + COARSE_BLOCK_CHAPTERS - 1}章粗纲`,
+        title: `第${block.fromChapter}–${studio ? actualEnd(block.fromChapter) : blockEnd(block.fromChapter)}章粗纲`,
         ordinal: block.fromChapter,
         goal: block.goal,
         conflict: block.conflict,
         outcome: block.outcome,
-        targetWords: COARSE_BLOCK_CHAPTERS * (project.summary.wordsPerChapter || 2500),
+        targetWords:
+          (studio ? actualEnd(block.fromChapter) - block.fromChapter + 1 : COARSE_BLOCK_CHAPTERS) *
+          (project.summary.wordsPerChapter || 2500),
         status: "草稿" as const,
         parentId: null,
       }));
@@ -1252,6 +1314,18 @@ export class AiService {
       return batch;
     }
     if (input.mode === "全书结构") {
+      const structureSchema = studio
+        ? StructurePlanningSchema.extend({
+            stages: z
+              .array(StructurePlanningSchema.shape.stages.element)
+              .min(structure.stages[0])
+              .max(structure.stages[1]),
+            volumes: z
+              .array(StructurePlanningSchema.shape.volumes.element)
+              .min(structure.volumes[0])
+              .max(structure.volumes[1]),
+          })
+        : StructurePlanningSchema;
       const structureUser = `${shared}\n输出 stages（${structure.stages[0]}至${structure.stages[1]}项）和 volumes（${structure.volumes[0]}至${structure.volumes[1]}项）。每项包含 title、goal、conflict、outcome、targetWords；stage 额外包含 startChapter。阶段标题必须是本书专属事件或状态，不得直接使用“开篇、追读、扩张、中期、高潮、收束”。各阶段目标字数之和应接近项目目标。`;
       const rangeIssues = (value: { stages: unknown[]; volumes: unknown[] }) => [
         ...(value.stages.length < structure.stages[0] || value.stages.length > structure.stages[1]
@@ -1272,7 +1346,7 @@ export class AiService {
           user: retryIssues
             ? `${structureUser}\n上一次输出未落在本书的结构区间：${retryIssues.join("；")}。请严格按区间数量重新输出。`
             : structureUser,
-          schema: StructurePlanningSchema,
+          schema: structureSchema,
           longTask: true,
           stream: true,
         });
@@ -1316,7 +1390,8 @@ export class AiService {
       return { startChapter: 1, chapters: [], plans: [...stagePlans, ...volumePlans] };
     }
     // 普通滚动规划保留小批量默认值；完整开书包按目标字数覆盖全书，输出仍按批次请求。
-    const count = input.chapterCount ?? (includeDraftPlans ? targetChapters : 10);
+    const requestedCount = input.chapterCount ?? (includeDraftPlans ? targetChapters : 10);
+    const count = studio ? Math.min(requestedCount, targetChapters - startChapter + 1) : requestedCount;
     const batches: PlanningGenerationResult[] = [];
     for (let offset = 0; offset < count; offset += CHAPTER_PLANNING_BATCH_SIZE) {
       const batchStart = startChapter + offset;
@@ -1339,7 +1414,7 @@ export class AiService {
         inputSummary: `${project.summary.title} 第${batchStart}-${batchStart + batchCount - 1}章章纲`,
         system:
           "你是中国商业网文连载编辑。生成可直接执行的连续章纲，不写正文。先判断每章承担行动、调查、关系、经营、训练、生存、群像、氛围、过渡、揭秘或高潮中的哪种主要功能，再决定节奏。章节要承接上一章的状态与悬念；关系、调查、氛围和过渡章可以通过认知、情绪、证据、关系或气氛积累推进，推进方式贴合本章功能。相邻章节在功能、场景数量和回报形态上保持变化。",
-        user: `${shared}\n本次任务前面刚生成且必须承接的章纲：${JSON.stringify(priorChapters)}\n从第${batchStart}章开始，严格输出${batchCount}个 chapters，并给出整个批次的 batchGoal、batchConflict、batchOutcome。每章填写 title、goal、conflict、outcome、chapterFunction、targetWords、chapterPromise、expectedPayoff、crisis、endingExpectation、payoffOffset、isKeyChapter 和 scenes。chapterFunction 必须使用规定枚举；targetWords 在 ${structure.chapterWords[0]}–${structure.chapterWords[1]} 之间（本书单章目标 ${project.summary.wordsPerChapter || 2500} 字），按内容密度决定，不要全都相同；scenes 为 ${structure.scenesPerChapter[0]}–${structure.scenesPerChapter[1]} 个真正需要的场景，每个包含 title、goal、conflict、outcome、targetWords，标题必须是本章具体事件，不得使用“入场、对抗、转向”等通用功能名。关系或氛围章可以只有 1–2 场，高潮章可以取区间上限。各场景目标字数之和应接近本章 targetWords。payoffOffset 表示该章结尾期待预计在几章后兑现。${includeDraftPlans ? `本次属于完整开书包的连续细化，沿已有宏观阶段和分卷推进，角色行动遵守人物档案中的知识边界，预计在第${targetChapters}章兑现终局；最后一批完成主要伏笔与人物弧光的收束。` : ""}`,
+        user: `${shared}\n本次任务前面刚生成且必须承接的章纲：${JSON.stringify(priorChapters)}\n从第${batchStart}章开始，严格输出${batchCount}个 chapters，并给出整个批次的 batchGoal、batchConflict、batchOutcome。每章填写 title、goal、conflict、outcome、chapterFunction、targetWords、chapterPromise、expectedPayoff、crisis、endingExpectation、payoffOffset、isKeyChapter 和 scenes。chapterFunction 必须使用规定枚举；targetWords 在 ${structure.chapterWords[0]}–${structure.chapterWords[1]} 之间（本书单章目标 ${project.summary.wordsPerChapter || 2500} 字），按内容密度决定，不要全都相同；scenes 为 ${structure.scenesPerChapter[0]}–${structure.scenesPerChapter[1]} 个真正需要的场景，每个包含 title、goal、conflict、outcome、targetWords，标题必须是本章具体事件，不得使用“入场、对抗、转向”等通用功能名。关系或氛围章可以只有 1–2 场，高潮章可以取区间上限。各场景目标字数之和应接近本章 targetWords。payoffOffset 表示该章结尾期待预计在几章后兑现。${studio ? `第${targetChapters}章是终局，endingExpectation 写收束后的余味，保留符合数据格式的 payoffOffset=1；终局余味不计入新的待兑现线索。` : ""}${includeDraftPlans ? `本次属于完整开书包的连续细化，沿已有宏观阶段和分卷推进，角色行动遵守人物档案中的知识边界，预计在第${targetChapters}章兑现终局；最后一批完成主要伏笔与人物弧光的收束。` : ""}`,
         schema: ChapterPlanningSchema,
         longTask: true,
         stream: true,
@@ -1391,9 +1466,12 @@ export class AiService {
           expectedPayoff: item.expectedPayoff,
           crisis: item.crisis,
           endingExpectation: item.endingExpectation,
-          expectationTargetChapter: includeDraftPlans
-            ? Math.min(targetChapters, number + item.payoffOffset)
-            : number + item.payoffOffset,
+          expectationTargetChapter:
+            studio && number === targetChapters
+              ? null
+              : includeDraftPlans || studio
+                ? Math.min(targetChapters, number + item.payoffOffset)
+                : number + item.payoffOffset,
           revision: 0,
           updatedAt: now(),
         };
@@ -1439,6 +1517,7 @@ export class AiService {
 
   async reviewPlanning(project: ProjectDetail, input: PlanningReviewInput): Promise<PlanningReviewResult> {
     if (!project.contract.approved) throw new Error("必须先审批创作契约");
+    const studio = studioPromptsFor(project.contract.lengthShape);
     const toChapter = input.fromChapter + input.chapterCount - 1;
     const structuralPlans = project.plans.filter((plan) => plan.kind === "宏观阶段" || plan.kind === "分卷");
     const scopedPlans = project.plans.filter(
@@ -1454,9 +1533,12 @@ export class AiService {
       taskType: "review-planning-logic",
       inputSummary: `审核第${input.fromChapter}-${toChapter}章规划逻辑`,
       system: [
-        "你是中文长篇小说的规划审稿总编。审核规划能否在不依赖作者脑补的情况下连续执行，并给出最小必要修复。",
+        `你是中文${studio ? "" : "长篇"}小说的规划审稿总编。审核规划能否在不依赖作者脑补的情况下连续执行，并给出最小必要修复。`,
         "逐项检查：宏观阶段与分卷是否覆盖契约；上下级目标是否一致；事件是否有原因、行动、反作用与结果；人物行动是否符合欲望和已知信息；设定与事实是否冲突；相邻章节是否重复同一功能和解法；期待是否有兑现位置；场景与篇幅是否匹配。",
         "关系、调查、氛围和过渡章不要求强冲突或即时胜利，但必须有可识别的认知、关系、证据、情绪或环境推进。不得用商业节奏名义把所有章节改成同一种结构。",
+        ...(studio
+          ? [studio.planning, "按作品形态检查的是阅读与改编建议。有明确依据的结构问题用既有分类标为警告或建议。"]
+          : []),
         "只依据输入指出问题。evidence 引用输入中的具体文字或编号，让每条结论可复核；没有证据的推测不要输出。",
         "修复要保留 targetId，只改真正有问题的字段，保持核心契约和本来合理的节点不变；全局性问题只给 issue，不要伪造 targetId。",
       ].join("\n"),
@@ -1744,6 +1826,7 @@ export class AiService {
     const characterWindow = guidanceCharacterWindow(targetCharacters, context.guidanceMode);
     const chapterFunction = chapter.chapterFunction ?? "行动";
     const level = resolveGuidanceLevel(context.guidanceMode);
+    const studio = studioPromptsFor(context.studio?.format);
     let result: z.infer<ReturnType<typeof chapterDraftSchema>>;
     try {
       result = await this.runJson({
@@ -1751,18 +1834,28 @@ export class AiService {
         taskType: "draft-chapter",
         inputSummary: `第${chapter.number}章 ${chapter.title || "未命名"}`,
         system: [
-          "你是这本书的协作写作者，和作者共同完成一部长篇网文。",
-          "首要任务是让本章读起来像这本书的一部分：延续已定稿正文的语感、节奏和人物声音，完成本章承诺，让读者愿意读下一章。",
+          studio?.draftRole ?? "你是这本书的协作写作者，和作者共同完成一部长篇网文。",
+          studio
+            ? "首要任务是延续本篇已定稿的语感、节奏和人物声音，完成本章承诺。"
+            : "首要任务是让本章读起来像这本书的一部分：延续已定稿正文的语感、节奏和人物声音，完成本章承诺，让读者愿意读下一章。",
           "以人物逻辑为先：角色的选择要能追溯到他的目标、处境和已知信息。",
           "契约、事实账本和知识边界是硬边界，只在冲突时让步；题材惯例、商业工具和密度统计都是参考，不构成必须逐条满足的清单。",
           "文风由本书的审美设定和已定稿正文决定；冷峻、克制、均衡、热烈都可能正确，取决于这本书选择了什么。",
           compileGuidanceModeInstruction(context.guidanceMode),
+          ...(studio ? [studio.draft] : []),
           renderStableBookContext(context),
         ].join("\n"),
         user: [
           "【本章】",
           `第${chapter.number}章 · 功能：${chapterFunction}`,
           `章纲：${chapter.outline}`,
+          ...(context.studio
+            ? [
+                chapter.number >= context.studio.targetChapters
+                  ? "本章是终局，结清开篇问题和行动后果，最后留可感知的余味。"
+                  : `本章位于计划的第 ${chapter.number} / ${context.studio.targetChapters} 章。`,
+              ]
+            : []),
           "",
           "【推进建议】",
           ...(level.beatSuggestion ? [compileBeatSuggestion(chapterFunction)] : []),
@@ -1879,23 +1972,33 @@ export class AiService {
     chapter: Chapter,
     context: ContextPackage,
     override?: TaskModelOverride,
+    options?: { attemptPolicy?: "default" | "single" },
   ): Promise<ChapterQualityReview> {
     const fanqieCategory = getFanqieCategoryProfile(project.contract?.fanqieCategoryKey);
-    const result = await this.runJson({
+    const format = project.contract?.lengthShape;
+    const studio = studioPromptsFor(format);
+    const request = {
       projectId: project.summary.id,
       taskType: "quality-review",
       override,
+      attemptPolicy: options?.attemptPolicy,
       inputSummary: `第${chapter.number}章语义质检`,
       system: [
         "你是这本书的审校伙伴。目标不是挑出尽可能多的问题，而是找出真正会伤害阅读体验或破坏连续性的地方。",
         "必须报告（有可验证证据才报）：违反契约不可破坏规则、与事实账本矛盾、角色使用尚未获得的信息、与研究样本重合。",
+        "结合带来源的有限前文核对人物身份与生死、叙述视角、关键日期、物件状态和已完成动作。作者已批准设定和已确认事实优先，待审前文只提供承接依据。",
+        "跨章冲突须确认是同一实体或同一事件的互不兼容陈述，continuityConflictConfirmed 才能为 true，并在 continuityEvidence 提供来源 sourceId、前文连续原句 previousQuote、本章连续原句 currentQuote 和 conflictKind。名字不同、别名、回忆、引语、转述、不同款项和有依据的状态改变应按其解释阅读；不确定时只作警告或观察。",
+        "仅在上下文明确标为终章核对时，对照开篇承诺、契约结局和到期期待检查主线兑现；尊重约定的开放结局及未到期支线。漏收悬念最高为期待兑现警告；重复原则说理、同义宣讲与文风偏好最高为警告，统计只作观察。",
         "可以报告（仅当明显影响阅读时才报，最多 5 条）：节奏停滞、重复信息、动机断裂、回报落空、章末缺乏推动力。",
         `项目审美设定：${compileAestheticGuidance(project.contract?.aestheticProfile)}`,
         "审美类问题只在本项目设定被明确违反时报告，不要把某一种叙事温度当成通用优点。",
         `题材专项检查：${GENRE_PLUGINS[project.summary.genre].qualityChecks.join("；")}。`,
-        ...(fanqieCategory ? [`分类专属检查：${fanqieCategory.qualityChecks.join("；")}。`] : []),
+        ...(fanqieCategory && format !== "万字短篇"
+          ? [`分类专属检查：${fanqieCategory.qualityChecks.join("；")}。`]
+          : []),
         "不要报告：文风偏好、可以更好但不算错的写法、把统计值当缺陷。",
         "统计观察（字数、情绪温度、感官密度、对话密度、重复短语）写入 observations，不要放进 issues。",
+        ...(studio ? [studio.review] : []),
         "evidence 必须是本章中的简短原文或明确的契约/事实条目。没有可验证问题时 issues 返回空数组。",
         renderStableBookContext(context),
       ].join("\n"),
@@ -1907,15 +2010,30 @@ export class AiService {
         renderContextForPrompt(context, { excludeStable: true }),
         "正文：",
         chapter.content.slice(0, 16000),
-        "输出 issues 与 observations。issues 每项包含 severity、category、message、evidence；observations 只写观察到的数据或现象，不写建议动作。",
+        "输出 issues 与 observations。issues 每项包含 severity、category、message、evidence、continuityConflictConfirmed、continuityEvidence；非跨章问题的 continuityEvidence 为 null。observations 只写观察到的数据或现象，不写建议动作。",
       ].join("\n"),
       schema: QualityReviewSchema,
       longTask: true,
       stream: true,
       reasoningEffort: "low",
+    } as const;
+    const route = this.resolveRoute?.("review", override) ?? null;
+    const windowTokens = resolveContextWindow({
+      contextWindow: route?.contextWindow,
+      localEndpoint: route?.localEndpoint,
     });
+    const requestInputTokens = estimateStructuredRequestTokens([
+      request.system,
+      request.user,
+      JSON.stringify(z.toJSONSchema(QualityReviewSchema)),
+    ]);
+    const availableOutput = Math.floor(windowTokens - requestInputTokens - 1_024);
+    if (availableOutput <= 0) throw new Error("审稿上下文超出所选模型窗口，未发送请求；请缩短内容或选择更大窗口模型");
+    const maxOutputTokens = Math.min(12_000, route?.maxOutputTokens ?? 12_000, availableOutput);
+    const result = await this.runJson({ ...request, maxOutputTokens });
+
     const evidenceSource = [
-      chapter.content,
+      chapter.content.slice(0, 16000),
       context.contract,
       context.volumeGoal,
       context.rollingOutline,
@@ -1926,11 +2044,42 @@ export class AiService {
       .replace(/\s+/g, "");
     return {
       issues: result.issues.map((issue) => {
+        const { continuityConflictConfirmed, continuityEvidence, ...baseIssue } = issue;
         const evidence = issue.evidence.trim();
         const supported = evidence.length >= 4 && evidenceSource.includes(evidence.replace(/\s+/g, ""));
+        const formatObservation = studio && format && issue.category.trim().startsWith(format);
+        const advisoryCategory = /重复|说理|文风|审美|期待兑现|回报落空|节奏|密度|温度|字数|篇幅|终章兑现/u.test(
+          issue.category,
+        );
+        const legacyHardCategory = /契约|事实|知识边界|原创|隐私|资源一致性|时间线|设定一致性/u.test(issue.category);
+        const crossChapterCategory = /连续性|人物|身份|生死|日期|物件|状态|动作|视角/u.test(issue.category);
+        const verifiedCitations =
+          continuityEvidence !== null &&
+          validateContinuityEvidence(
+            continuityEvidence,
+            chapter.content.slice(0, 16000),
+            context.continuitySources ?? [],
+          );
+        const priorSource = continuityEvidence
+          ? context.continuitySources?.find((source) => source.id === continuityEvidence.sourceId)
+          : undefined;
+        const approvedViewpoint =
+          continuityEvidence?.conflictKind !== "视角" ||
+          (priorSource?.kind === "作者设定" &&
+            priorSource.authority === "已确认" &&
+            /第一人称|第二人称|第三人称|叙述视角|全知视角|限知视角/u.test(continuityEvidence.previousQuote));
+        const validContinuity = verifiedCitations && continuityConflictConfirmed && approvedViewpoint;
+        const hardSupported =
+          continuityEvidence !== null || continuityConflictConfirmed || crossChapterCategory
+            ? validContinuity && (legacyHardCategory || crossChapterCategory)
+            : legacyHardCategory && supported;
         return {
-          ...issue,
-          severity: issue.severity === "硬性" && !supported ? ("警告" as const) : issue.severity,
+          ...baseIssue,
+          ...(continuityEvidence && verifiedCitations ? { continuityEvidence } : {}),
+          severity:
+            issue.severity === "硬性" && (!hardSupported || formatObservation || advisoryCategory)
+              ? ("警告" as const)
+              : issue.severity,
           evidence,
           id: randomUUID(),
           projectId: project.summary.id,

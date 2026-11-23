@@ -6,6 +6,19 @@ export function assertLocalResearchImportRights(rightsConfirmed: boolean): void 
   }
 }
 
+export const RESEARCH_URL_ERROR = "来源链接只允许不含账号或密码的 HTTP/HTTPS 地址";
+
+export function isResearchSourceUrl(value: string): boolean {
+  if (!value) return true;
+  if (!/^https?:\/\//i.test(value)) return false;
+  try {
+    const url = new URL(value);
+    return !url.username && !url.password;
+  } catch {
+    return false;
+  }
+}
+
 interface PrepareLocalResearchBookOptions {
   createId: () => string;
   currentTimestamp: () => string;
@@ -25,12 +38,18 @@ export function prepareLocalResearchBook(
   options: PrepareLocalResearchBookOptions,
 ): ResearchBook {
   assertLocalResearchImportRights(rightsConfirmed);
+  const reference = preview.reference;
+  const url = reference?.url.trim() ?? "";
+  const platform = reference?.platform.trim() ?? "";
+  if (!isResearchSourceUrl(url)) throw new Error(RESEARCH_URL_ERROR);
   return {
     id: options.createId(),
-    title: researchBookTitle(preview.fileName),
-    author: "未标注",
+    title: reference?.title.trim() || researchBookTitle(preview.fileName),
+    author: reference?.author.trim() || "未标注",
     genre,
     sourceType: preview.sourceType,
+    ...(url ? { sourceUrl: url } : {}),
+    ...(platform ? { sourcePlatform: platform } : {}),
     chapterCount: preview.chapters.length,
     wordCount: preview.totalWords,
     rightsConfirmed,

@@ -252,11 +252,28 @@ function createDependencies(completion: Promise<Chapter> = new Promise(() => {})
     inputTokens: 100,
     outputTokens: 2_000,
     estimatedCost: 0.01,
+    reviewCalls: 1,
+    reviewInputTokens: 100,
+    reviewOutputTokens: 2000,
+    costEstimateComplete: true,
     canRun: true,
     blockingReason: null,
   };
   const previewChapterBatch = vi.fn(() => batchPreview);
-  const generateChapterBatch = vi.fn(async () => [chapter]);
+  const generateChapterBatch = vi.fn(async () => ({
+    chapters: [chapter],
+    status: "completed",
+    stoppedAtChapter: null,
+    reason: null,
+  }));
+  const quality = {
+    run: vi.fn(async () => ({
+      issues: [localQualityIssue],
+      observations: [],
+      check: { status: "未完成检查", reason: "cloud unavailable" },
+    })),
+    reusable: vi.fn(),
+  };
   const runLocalQualityCheck = vi.fn(async () => ({ issues: [localQualityIssue], observations: [] }));
   let idSequence = 0;
   const createId = vi.fn(() => `generated-${++idSequence}`);
@@ -287,6 +304,7 @@ function createDependencies(completion: Promise<Chapter> = new Promise(() => {})
     sendChapterDraftStream,
     previewChapterBatch,
     generateChapterBatch,
+    quality,
     runLocalQualityCheck,
     createId,
     currentTimestamp,
@@ -312,6 +330,7 @@ function createDependencies(completion: Promise<Chapter> = new Promise(() => {})
     previewChapterBatch,
     generateChapterBatch,
     batchPreview,
+    quality,
     runLocalQualityCheck,
     createId,
     currentTimestamp,
@@ -365,51 +384,15 @@ describe("AI handlers", () => {
     });
   });
 
-  it("passes a single-use override through to the task services", async () => {
-    const { dependencies, handlers, database, ai, saveApiKey } = createDependencies();
-    database.getProject.mockReturnValue(qualityProject);
-    ai.reviewChapter.mockResolvedValue({ issues: [], observations: [] });
-    await saveApiKey("secret");
+  it("delegates manual quality checks and forwards the single-use override", async () => {
+    const { dependencies, handlers, quality, ai } = createDependencies();
     registerAiHandlers(dependencies);
-
-    await handlers.get("testAiConnection")!({ profileId: "profile-cheap" });
-    expect(ai.testConnection).toHaveBeenCalledWith({ profileId: "profile-cheap" });
-
-    await handlers.get("runQualityCheck")!("project-1", qualityChapter.id, { profileId: "profile-cheap" });
-    expect(ai.reviewChapter).toHaveBeenCalledWith(expect.anything(), qualityChapter, expect.anything(), {
-      profileId: "profile-cheap",
-    });
-  });
-
-  it("merges local quality results with semantic fallback and advances drafts", async () => {
-    const { dependencies, handlers, database, ai, saveApiKey, runLocalQualityCheck } = createDependencies();
-    database.getProject.mockReturnValue(qualityProject);
-    ai.reviewChapter.mockRejectedValue(new Error("cloud unavailable"));
-    await saveApiKey("secret");
-    registerAiHandlers(dependencies);
-
-    const result = await handlers.get("runQualityCheck")!("project-1", qualityChapter.id);
-
-    expect(runLocalQualityCheck).toHaveBeenCalledWith(
-      expect.objectContaining({
-        projectId: "project-1",
-        chapter: qualityChapter,
-        previousChapter: expect.objectContaining({ number: 1 }),
-        recentChapters: [expect.objectContaining({ number: 1 })],
-        originalityMatches: [],
-      }),
-    );
-    expect(result.issues).toEqual([
-      localQualityIssue,
-      expect.objectContaining({
-        category: "语义质检",
-        severity: "警告",
-        evidence: "cloud unavailable",
-      }),
-    ]);
-    expect(result.observations).toEqual([]);
-    expect(database.saveIssues).toHaveBeenCalledWith("project-1", qualityChapter.id, result.issues);
-    expect(database.transitionChapter).toHaveBeenCalledWith("project-1", qualityChapter.id, "待质检");
+    const override = { profileId: "profile-cheap" };
+    await handlers.get("testAiConnection")!(override);
+    expect(ai.testConnection).toHaveBeenCalledWith(override);
+    const result = await handlers.get("runQualityCheck")!("project-1", qualityChapter.id, override);
+    expect(quality.run).toHaveBeenCalledWith("project-1", qualityChapter.id, { trigger: "manual", override });
+    expect(result).toMatchObject({ check: { status: "未完成检查" }, issues: [localQualityIssue] });
   });
 
   it("holds and releases the project generation lock while revising quality issues", async () => {
@@ -481,8 +464,18 @@ describe("AI handlers", () => {
     });
 
     expect(handlers.get("previewChapterBatch")!("project-1", chapter.id)).toBe(batchPreview);
-    expect(previewChapterBatch).toHaveBeenCalledWith(planningProject, { ...settings, hasApiKey: false }, chapter.id);
-    await expect(handlers.get("generateChapterBatch")!("project-1", chapter.id)).resolves.toEqual([chapter]);
+    expect(previewChapterBatch).toHaveBeenCalledWith(
+      planningProject,
+      { ...settings, hasApiKey: false },
+      chapter.id,
+      undefined,
+    );
+    await expect(handlers.get("generateChapterBatch")!("project-1", chapter.id)).resolves.toEqual({
+      chapters: [chapter],
+      status: "completed",
+      stoppedAtChapter: null,
+      reason: null,
+    });
     expect(generateChapterBatch).toHaveBeenCalledWith("project-1", chapter.id, undefined);
   });
 

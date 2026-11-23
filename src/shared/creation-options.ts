@@ -22,6 +22,8 @@ export const LENGTH_SHAPES = [
   { name: "单元剧", detail: "单元闭环 + 主线谜团，适合快穿/无限流" },
   { name: "多卷史诗", detail: "多势力多视角，适合群像/争霸" },
   { name: "日常经营", detail: "低强度长线，靠生活与经营回报" },
+  { name: "短剧改编向", detail: "可拍行动与分段兑现，默认 4 万字" },
+  { name: "万字短篇", detail: "盐言故事方向，一条主线五节收束" },
 ] as const;
 export type LengthShape = (typeof LENGTH_SHAPES)[number]["name"];
 

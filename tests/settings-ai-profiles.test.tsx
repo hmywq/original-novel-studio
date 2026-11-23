@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SettingsPage } from "../src/pages/SettingsPage";
@@ -157,6 +157,44 @@ describe("settings model sources", () => {
     await waitFor(() => expect(api.refreshAiProfileModels).toHaveBeenCalledWith("p-main", true));
   });
 
+  it("searches the platform directory and changes the source default model with explicit selection", async () => {
+    const api = createApi({
+      listAiProfiles: vi.fn().mockResolvedValue([
+        profile({
+          name: "APIGoto",
+          baseUrl: "https://api.apigoto.com/v1",
+          defaultModel: "gpt-6.1-sol",
+          lastTestOk: false,
+        }),
+      ]),
+      refreshAiProfileModels: vi.fn().mockResolvedValue(["gpt-6.1-sol", "deepseek-v4-pro"]),
+      listAiProfileModels: vi.fn().mockResolvedValue([
+        { modelId: "gpt-6.1-sol", source: "provider-catalog", fetchedAt: "2026-09-08T00:00:00.000Z" },
+        { modelId: "deepseek-v4-pro", source: "provider-catalog", fetchedAt: "2026-09-08T00:00:00.000Z" },
+      ]),
+    });
+    render(<SettingsPage api={api} notify={vi.fn()} />);
+
+    await userEvent.click(await screen.findByRole("button", { name: /刷新模型/ }));
+    const dialog = within(await screen.findByRole("dialog", { name: /查找模型.*APIGoto/ }));
+    expect(await dialog.findByText(/公开目录.*测试连接/)).toBeTruthy();
+    await userEvent.type(dialog.getByRole("textbox", { name: /搜索模型/ }), "deepseek");
+    expect(dialog.queryByRole("option", { name: /gpt-6.1-sol/ })).toBeNull();
+    await userEvent.selectOptions(dialog.getByRole("combobox", { name: /模型清单/ }), "deepseek-v4-pro");
+    await userEvent.click(dialog.getByRole("button", { name: "设为来源默认模型" }));
+
+    await waitFor(() =>
+      expect(api.saveAiProfile).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: "p-main",
+          defaultModel: "deepseek-v4-pro",
+          lastTestOk: null,
+        }),
+      ),
+    );
+    expect(api.testAiProfile).not.toHaveBeenCalled();
+  });
+
   it("offers the source's models to the role route picker", async () => {
     const api = createApi({
       listAiRoleRoutes: vi.fn().mockResolvedValue([{ role: "draft", profileId: "p-main", modelId: null }]),
@@ -172,6 +210,29 @@ describe("settings model sources", () => {
       );
       expect(values).toContain("deepseek-reasoner");
     });
+  });
+
+  it("lets concept generation select a model independently", async () => {
+    const api = createApi({
+      listAiRoleRoutes: vi.fn().mockResolvedValue([
+        { role: "concept", profileId: "p-main", modelId: "idea-model" },
+        { role: "plan", profileId: "p-main", modelId: "outline-model" },
+      ]),
+      listAiProfileModels: vi.fn().mockResolvedValue([
+        { modelId: "idea-model", source: "remote", fetchedAt: "2026-09-08T00:00:00.000Z" },
+        { modelId: "outline-model", source: "remote", fetchedAt: "2026-09-08T00:00:00.000Z" },
+      ]),
+    });
+    render(<SettingsPage api={api} notify={vi.fn()} />);
+
+    expect(await screen.findByText("选题生成")).toBeTruthy();
+    const conceptModel = await screen.findByDisplayValue("idea-model");
+    expect(conceptModel.getAttribute("list")).toBe("ai-role-model-options-concept");
+    await userEvent.clear(conceptModel);
+    await userEvent.type(conceptModel, "new-idea-model");
+    await userEvent.tab();
+
+    await waitFor(() => expect(api.setAiRoleRoute).toHaveBeenCalledWith("concept", "p-main", "new-idea-model"));
   });
 
   it("saves the outbound proxy settings", async () => {

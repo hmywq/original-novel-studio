@@ -77,11 +77,22 @@ function roleModelListId(role: ModelRole) {
 }
 
 function describeModelsHint(profile: AiProfileView, options: AiProfileModelOption[]) {
-  if (profile.apiSurface === "anthropic-messages") return "该端点不支持模型清单，可手动填写";
-  if (!options.length) return "暂时没有模型清单，可手动填写";
+  if (!options.length)
+    return profile.apiSurface === "anthropic-messages"
+      ? "该端点不支持模型清单，可手动填写"
+      : "暂时没有模型清单，可手动填写";
   const count = (source: AiProfileModelOption["source"]) => options.filter((option) => option.source === source).length;
-  return `已获取 ${options.length} 个模型（远端 ${count("remote")} / 探测 ${count("probe")} / 手填 ${count("user")}）`;
+  return `已获取 ${options.length} 个模型（API 返回 ${count("remote")} / 公开目录 ${count("provider-catalog")} / 探测 ${count("probe")} / 手填 ${count("user")}）`;
 }
+
+const MODEL_OPTION_LABELS: Record<AiProfileModelOption["source"], string> = {
+  "provider-catalog": "平台公开目录",
+  remote: "来源 API 返回",
+  probe: "已探测",
+  user: "手动设置",
+  catalog: "内置目录",
+  default: "默认选项",
+};
 
 function describeRouteModelHint(profile: AiProfileView, options: AiProfileModelOption[]) {
   const fallback = `该来源默认：${profile.defaultModel || "未设置"}`;
@@ -108,6 +119,9 @@ export function AiProfileManager({
   const [health, setHealth] = useState<AiProfileHealth[]>([]);
   const [transfer, setTransfer] = useState<{ mode: "export" | "import"; text: string } | null>(null);
   const [modelOptions, setModelOptions] = useState<Record<string, AiProfileModelOption[]>>({});
+  const [lookup, setLookup] = useState<{ profileId: string; modelIds: string[] | null; error?: string } | null>(null);
+  const [modelQuery, setModelQuery] = useState("");
+  const [selectedModel, setSelectedModel] = useState("");
 
   const reload = useCallback(async () => {
     const [nextProfiles, nextRoutes, nextDefault, nextHealth] = await Promise.all([
@@ -216,6 +230,27 @@ export function AiProfileManager({
     }
   };
 
+  const refreshLookup = async (profileId: string) => {
+    setBusyId(profileId);
+    try {
+      const modelIds = await fetchModels(profileId, true);
+      setLookup((current) => (current?.profileId === profileId ? { profileId, modelIds } : current));
+    } catch (error) {
+      setLookup((current) =>
+        current?.profileId === profileId ? { profileId, modelIds: null, error: describeError(error) } : current,
+      );
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const openLookup = (profileId: string) => {
+    setLookup({ profileId, modelIds: null });
+    setModelQuery("");
+    setSelectedModel("");
+    void refreshLookup(profileId);
+  };
+
   const updateRoute = async (role: ModelRole, profileId: string, modelId: string) => {
     try {
       await api.setAiRoleRoute(role, profileId || null, modelId.trim() || null);
@@ -227,6 +262,15 @@ export function AiProfileManager({
 
   const enabledProfiles = profiles.filter((profile) => profile.enabled);
   const defaultProfile = profiles.find((profile) => profile.id === defaultId) ?? null;
+  const lookupProfile = profiles.find((profile) => profile.id === lookup?.profileId);
+  const lookedUpOptions = lookupProfile ? (modelOptions[lookupProfile.id] ?? []) : [];
+  const returnedModels = lookup?.modelIds ? new Set(lookup.modelIds) : null;
+  const foundOptions = returnedModels
+    ? lookedUpOptions.filter((option) => returnedModels.has(option.modelId))
+    : lookedUpOptions;
+  const matchingOptions = foundOptions.filter((option) =>
+    option.modelId.toLowerCase().includes(modelQuery.trim().toLowerCase()),
+  );
 
   return (
     <>
@@ -305,17 +349,8 @@ export function AiProfileManager({
               >
                 测试连接
               </Button>
-              <Button
-                variant="secondary"
-                disabled={busyId === profile.id}
-                onClick={() =>
-                  void run(profile.id, async () => {
-                    const models = await fetchModels(profile.id, true);
-                    return models.length ? `已获取 ${models.length} 个模型` : "该端点没有返回模型清单，可手动填写";
-                  })
-                }
-              >
-                <RefreshCw size={14} /> 刷新模型
+              <Button variant="secondary" disabled={busyId === profile.id} onClick={() => openLookup(profile.id)}>
+                <RefreshCw size={14} /> 查找 / 刷新模型
               </Button>
               <Button
                 variant="secondary"
@@ -483,6 +518,78 @@ export function AiProfileManager({
           });
         })()}
       </div>
+
+      {lookupProfile && lookup && (
+        <Modal title={`查找模型 · ${lookupProfile.name}`} onClose={() => setLookup(null)} width={640}>
+          <div className="settings-form">
+            {foundOptions.some((option) => option.source === "provider-catalog") ? (
+              <p className="muted">平台公开目录列出已公开的型号。选用后可点「测试连接」验证当前密钥是否有调用权限。</p>
+            ) : (
+              <p className="muted">选择该来源返回的型号即可填写默认模型，可点「测试连接」验证调用。</p>
+            )}
+            {busyId === lookupProfile.id && <p role="status">正在查询模型…</p>}
+            {lookup.error && <p role="alert">{lookup.error}。可查看已有型号，或在来源编辑里手动填写。</p>}
+            {!foundOptions.length && busyId !== lookupProfile.id && !lookup.error && (
+              <p className="muted">该端点未返回模型清单。可以在来源编辑里手动填写型号。</p>
+            )}
+            {foundOptions.length > 0 && (
+              <>
+                <Field label="搜索模型">
+                  <Input
+                    value={modelQuery}
+                    placeholder="输入型号文字"
+                    onChange={(event) => {
+                      setModelQuery(event.target.value);
+                      setSelectedModel("");
+                    }}
+                  />
+                </Field>
+                <Field label="模型清单" hint={`显示 ${matchingOptions.length} / ${foundOptions.length} 个型号`}>
+                  <Select value={selectedModel} onChange={(event) => setSelectedModel(event.target.value)}>
+                    <option value="">{matchingOptions.length ? "请选择型号" : "无匹配型号"}</option>
+                    {matchingOptions.map((option) => (
+                      <option key={option.modelId} value={option.modelId}>
+                        {option.modelId} · {MODEL_OPTION_LABELS[option.source]}
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+              </>
+            )}
+            <div className="settings-actions">
+              <Button
+                disabled={
+                  busyId === lookupProfile.id ||
+                  !matchingOptions.some((option) => option.modelId === selectedModel) ||
+                  selectedModel === lookupProfile.defaultModel
+                }
+                onClick={() =>
+                  void run(lookupProfile.id, async () => {
+                    await api.saveAiProfile({
+                      ...lookupProfile,
+                      defaultModel: selectedModel,
+                      lastTestAt: null,
+                      lastTestOk: null,
+                      lastError: null,
+                    });
+                    setLookup(null);
+                    return `已将「${lookupProfile.name}」的默认模型改为 ${selectedModel}`;
+                  })
+                }
+              >
+                设为来源默认模型
+              </Button>
+              <Button
+                variant="secondary"
+                disabled={busyId === lookupProfile.id}
+                onClick={() => void refreshLookup(lookupProfile.id)}
+              >
+                刷新模型
+              </Button>
+            </div>
+          </div>
+        </Modal>
+      )}
 
       {editing && (
         <Modal

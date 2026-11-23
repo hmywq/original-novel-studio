@@ -21,6 +21,7 @@ export const CONTEXT_LAYOUT = [
   { key: "commercialGuidance", band: "fast" },
   { key: "expectationLedger", band: "fast" },
   { key: "recentSummary", band: "fast" },
+  { key: "continuity", band: "fast" },
   { key: "relevantFacts", band: "fast" },
   { key: "storyEntries", band: "fast" },
   { key: "rollingOutline", band: "fast" },

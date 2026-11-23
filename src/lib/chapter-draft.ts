@@ -1,7 +1,14 @@
 import type { Chapter } from "../shared/types";
 
 export function chapterDraftSignature(chapter: Chapter) {
-  const { id: _id, revision: _revision, updatedAt: _updatedAt, wordCount: _wordCount, ...editable } = chapter;
+  const {
+    id: _id,
+    revision: _revision,
+    updatedAt: _updatedAt,
+    wordCount: _wordCount,
+    qualityCheck: _qualityCheck,
+    ...editable
+  } = chapter;
   return JSON.stringify(editable);
 }
 
@@ -17,7 +24,7 @@ export function readRecoveredChapter(
   try {
     const recovered = storage.getItem(chapterRecoveryKey(projectId, chapter));
     if (!recovered) return chapter;
-    const parsed = JSON.parse(recovered) as Chapter;
+    const parsed = { ...JSON.parse(recovered), qualityCheck: chapter.qualityCheck } as Chapter;
     if (parsed.id !== chapter.id) return chapter;
     // 尚未落库的新章没有服务端版本可比较：恢复稿只要有内容就采用。
     // 否则 EMPTY_CHAPTER 每次生成的当前时间戳会让恢复稿永远"过期"。

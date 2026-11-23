@@ -1,32 +1,30 @@
-# 长篇创作工作台
+# 原创小说工作台
 
-面向番茄小说长篇连载的 Windows 本地工作台。应用覆盖榜单研究、样本拆书、原创立项、300 万字滚动规划、逐章/五章批次写作、状态账本、质检、发布排期与数据复盘，并为每本作品建立独立数据库和检索索引。
+面向中文小说作者的 Windows 本地工作台，支持长篇连载、万字短篇和短剧改编向小说。从榜单研究、样本拆书、脑洞和模板出发，进入立项、规划、写作、跨章质检和导出。每部作品都有独立的 SQLite 数据库和检索索引，定稿及投稿由作者确认。
 
-应用不会登录番茄账号，也不会自动发布作品。所有发布动作均由作者在平台后台人工完成。
+基于 juice4927 的 [fanqie-novel-studio v0.7.0](https://github.com/juice4927/fanqie-novel-studio/tree/7aff876062b48035af42f99b51b9e86afcc6146d)。本仓库增加了跨平台选书、授权榜单 CSV 定时同步、洞察人工校正、50 套开书模板、按任务选择模型和跨章连续性检查。
 
-## 安装与启动
+## 从源码启动
 
-正式安装包位于：
+在 Windows 10 或 11 上准备 Git 和 Node.js 22 或更新版本。在 PowerShell 中运行：
 
-```text
-release\长篇创作工作台 Setup 0.5.1.exe
+```powershell
+git clone https://github.com/hmywq/original-novel-studio.git
+cd original-novel-studio
+npm ci
+npm run build
+.\start-novel-studio.cmd
 ```
 
-双击安装包，选择安装目录后完成安装。当前开发版没有商业代码签名证书，Windows SmartScreen 可能显示未知发布者；正式对外分发前应配置受信任的代码签名证书。
-
-免安装构建位于：
-
-```text
-release\win-unpacked\长篇创作工作台.exe
-```
+启动器会在源码目录下创建 `.workspace` 和 `.local-profile`。浏览器演示可用 `npm run dev:web` 启动，桌面版提供凭据管理、作品数据库和完整质检。[使用说明](使用说明.md)
 
 ## 首次配置
 
-1. 打开“系统设置”。
+1. 打开“系统设置 → AI 来源”。
 2. 选择模型接口协议并填写 API 基础地址和模型名：
    - `OpenAI / 兼容接口`：`gpt-*` 模型优先使用 Responses API，其他模型使用兼容 Chat Completions；通过 OpenRouter、OneAPI 等兼容网关调用 Claude 也选择此项。
    - `Anthropic Claude`：直接调用 Anthropic Messages API，默认基础地址为 `https://api.anthropic.com/v1`，模型名填写 Anthropic 控制台当前可用的模型 ID。
-3. 填写输入、输出单价，用于批量任务执行前估算费用。
+3. 填写输入、输出单价以估算批量费用。在“角色路由”给不同任务指定来源和模型，也可以统一使用默认配置。
 4. 长任务总时限默认 10 分钟，可在 5、10、15 分钟之间选择；长任务流式响应连续 180 秒无数据会提前停止。
 5. 保存 API 密钥。密钥存入 Windows Credential Manager，不写入 SQLite、日志、项目目录或备份包。
 6. 在“多书总览”新建作品。每本书会立即建立独立目录、`project.sqlite`、FTS5 索引和语义向量表。
@@ -39,7 +37,7 @@ Anthropic 支持使用官方 API 密钥，不读取或复用 Claude Code / Claud
 
 ## 推荐工作流
 
-1. 在“市场研究”采集无需登录的公开榜单页，或导入榜单 CSV。至少积累多个日期的快照后再判断趋势。
+1. 在“市场研究”打开平台入口查看公开页面，导入本地榜单 CSV 或定时同步有权使用的 HTTPS CSV 数据源。积累多个日期的同口径快照后再判断趋势。
 2. 导入有合法使用权的 TXT、EPUB、DOCX 或粘贴文本，检查切章预览后确认入库。
 3. 选择仅本地分析，或明确同意本地脱敏后按十章批次调用云模型。系统生成章节、十章阶段、分卷、全书四级证据。
    拆解采用内置中国商业网文知识库，逐章提取进入期待、核心利益、主动行动、情绪回报、实际影响和下一期待；平台经验中的字数密度只作观察指标，不作为机械门禁。
@@ -81,14 +79,14 @@ Anthropic 支持使用官方 API 密钥，不读取或复用 Claude Code / Claud
 
 - Electron 渲染进程启用 sandbox、context isolation 和内容安全策略，不开放 Node.js 集成。
 - IPC 只接受主窗口调用；所有公开 API 都必须注册 Zod 参数 schema，未注册通道默认拒绝，并限制正文、CSV、URL、数组和密码规模。
-- 榜单采集与模型地址只允许 HTTP/HTTPS 协议。公开页面采集会在请求及每次重定向前拒绝本机、私网和保留地址；参数错误只报告字段路径和规则，不回显 API 密钥、备份密码或完整正文。
+- 榜单同步使用直接返回 CSV 的 HTTPS 地址，请求时拒绝本机、私网和保留地址。模型地址使用 HTTP 或 HTTPS，本机模型走显式配置。参数错误只报告字段路径和规则，避免回显密钥、密码和正文。
 
 ## 数据位置
 
-默认工作区：
+通过 `npm run dev` 启动时，默认工作区结构如下：
 
 ```text
-%USERPROFILE%\Documents\长篇创作工作台数据\
+Windows 的“文档”文件夹\原创小说工作台数据\
 ├─ catalog.sqlite
 ├─ research\research.sqlite
 ├─ projects\<作品ID>\project.sqlite
@@ -97,7 +95,7 @@ Anthropic 支持使用官方 API 密钥，不读取或复用 Claude Code / Claud
 └─ backups\
 ```
 
-开发和自动化测试可通过 `NOVEL_STUDIO_WORKSPACE` 指定独立工作区。不同作品之间不会执行跨项目全文或向量检索。
+通过 `start-novel-studio.cmd` 启动时，同一结构位于源码目录的 `.workspace`。开发和自动化测试可通过 `NOVEL_STUDIO_WORKSPACE` 指定独立工作区。每部作品独立进行全文检索。
 
 ## 备份与恢复
 
@@ -139,7 +137,7 @@ Anthropic 支持使用官方 API 密钥，不读取或复用 Claude Code / Claud
 工程优化路线图见 [docs/OPTIMIZATION_EXECUTION.md](docs/OPTIMIZATION_EXECUTION.md)。
 架构与依赖方向见 [docs/architecture.md](docs/architecture.md)，领域门禁见 [docs/domain-rules.md](docs/domain-rules.md)，商业知识库与质量基准见 [docs/knowledge-base.md](docs/knowledge-base.md)，安全模型见 [docs/security.md](docs/security.md)。
 
-建议使用 Node.js 22 LTS、Windows 10/11 和 SSD：
+开发模式会同时启动前端和桌面应用：
 
 ```powershell
 npm ci
@@ -152,15 +150,13 @@ npm run dev
 npm test                 # 单元与隔离测试
 npm run test:quality     # 提示词结构与小说质量固定基准
 npm run test:scale       # 10 本书 × 1500 章 × 300 万字容量测试
+npx playwright install chromium  # 首次运行浏览器测试时安装 Chromium
 npm run test:e2e         # 浏览器桌面/移动端交互测试
 npm run build            # React 与 Electron 生产构建
-npm run test:electron    # 源码生产构建及打包应用冒烟测试
-npm run dist:win         # 生成 Windows NSIS 安装包
+npm run test:electron    # 运行 Electron 测试，先执行 build
 ```
 
-公开榜单采集只访问用户提供的无需登录 HTTP/HTTPS 页面，不携带 Cookie、不绕过访问限制。页面无法稳定访问时应改用 CSV 或人工录入。
-
-番茄榜单书目支持读取官方公开的前 10 章作为“开篇样本”并进入拆书流程。系统只接受无需登录且标记为免费的章节；遇到付费、验证、目录缺失或正文无法可靠识别时停止，不保存不完整样本。公开试读与用户自行导入且确认权利的材料分开标记，语义拆书上云必须单独勾选同意。
+拆书样本来自用户有权使用的本地材料。云端语义拆书须在发送脱敏片段前逐本确认。
 
 ## P2 工程保障
 
@@ -170,10 +166,8 @@ npm run dist:win         # 生成 Windows NSIS 安装包
 - 打开项目时 SQLite 只返回章节标题、状态、字数等元数据，不向界面传输整本正文；写作台选中章节后才按 ID 读取该章正文。章节列表使用虚拟窗口，首次增量加载 200 章；全文检索每页 50 条，并在滚动到底部后继续加载。
 - AI 审计默认保留 90 天且最多 5000 条；健康任务保留 24 小时且最多 100 条完成记录。
 - 桌面日志为 JSON Lines，写盘前脱敏密钥、Bearer、URL 凭据和 Windows 用户目录。系统设置可导出不含正文和数据库的诊断 ZIP。
-- 自动更新只在打包应用中启用：启动 15 秒后自动检查（可在“系统设置 → 软件更新”关闭），此后每 6 小时复查一次；发现新版本后在后台下载，就绪时只在主界面提示，**不会自动重启**。点击“立即重启并安装”后先创建加密的 `pre-update-<version>.novelbak` 数据快照，再退出并安装；未保存自动备份密码时可输入一次性密码，正在生成正文时会拒绝安装。也可开启“退出时自动安装”。安装器失败时保留当前版本。数据恢复仍需通过“校验并恢复副本”人工确认，避免自动覆盖唯一工作区。
-- 更新源固定为项目的 GitHub Releases，只请求 `latest.yml`，不上传正文、账本或凭据；设置 `NOVEL_STUDIO_DISABLE_AUTO_UPDATE=1` 可完全禁用更新检查。
 
-Windows 发布流水线需要配置 `WINDOWS_CERTIFICATE_BASE64`、`WINDOWS_CERTIFICATE_PASSWORD` 和 `WINDOWS_PUBLISHER_NAME` 三个 GitHub Secrets。标签 `v*` 触发测试、构建、签名、GitHub Release 和 `latest.yml` 更新通道发布。
+GitHub Actions 运行源码检查、测试和构建。当前通过仓库分发源码，内置软件更新关闭。
 
 ## 质量评测基准
 
@@ -191,4 +185,4 @@ Windows 发布流水线需要配置 `WINDOWS_CERTIFICATE_BASE64`、`WINDOWS_CERT
 
 ## 开源许可
 
-本项目基于 [MIT License](LICENSE) 开源。欢迎以 issue、PR 或讨论区形式参与；涉及领域规则（门禁链、质检提示词、知识库）的改动请先阅读 [AGENTS.md](AGENTS.md)。
+本项目按 [MIT 许可](LICENSE) 开源。上游贡献、词表来源及第三方许可见 [第三方来源与许可](THIRD_PARTY_NOTICES.md)。欢迎提交问题和改动，涉及创作规则、质检提示词或知识库时请先阅读 [AGENTS.md](AGENTS.md)。

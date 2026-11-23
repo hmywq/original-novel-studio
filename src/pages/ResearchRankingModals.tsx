@@ -1,14 +1,14 @@
 import { Play, Trash2 } from "lucide-react";
+import { useState } from "react";
 import { Badge, Button, Field, Input, Modal, Select, Textarea } from "../components/UI";
-import { formatDate } from "../lib/format";
-import { FANQIE_CATEGORIES, type FanqieRankKind } from "../shared/fanqie-taxonomy";
 import type { RankingCaptureSchedule } from "../shared/types";
 import styles from "./ResearchPage.module.css";
 
-export { FANQIE_CATEGORIES };
-
-export type FanqieGender = keyof typeof FANQIE_CATEGORIES;
-export type { FanqieRankKind };
+const beijingTime = new Intl.DateTimeFormat("zh-CN", {
+  dateStyle: "short",
+  timeStyle: "short",
+  timeZone: "Asia/Shanghai",
+});
 
 interface RankingImportModalProps {
   open: boolean;
@@ -29,14 +29,46 @@ export function RankingImportModal({
   onClose,
   onSave,
 }: RankingImportModalProps) {
+  const [fileError, setFileError] = useState("");
   if (!open) return null;
   return (
     <Modal title="导入榜单 CSV" onClose={onClose}>
       <div className="form-stack">
         <Field label="榜单名称">
-          <Input value={rankingName} onChange={(event) => onRankingNameChange(event.target.value)} />
+          <Input
+            value={rankingName}
+            maxLength={200}
+            placeholder="如番茄女频·悬疑脑洞新书榜"
+            onChange={(event) => onRankingNameChange(event.target.value)}
+          />
         </Field>
-        <Field label="CSV 内容" hint="支持字段：排名、书名、作者、题材、字数、状态、标签、链接">
+        <Field label="选择 CSV 文件" hint="UTF-8 编码，最大 5 MB。也可以粘贴到下方。">
+          <Input
+            type="file"
+            accept=".csv,text/csv"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              setFileError("");
+              if (!file) return;
+              if (file.size > 5_000_000) {
+                setFileError("请选择不超过 5 MB 的 CSV。");
+                return;
+              }
+              void file
+                .arrayBuffer()
+                .then((bytes) => {
+                  onRankingCsvChange(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+                })
+                .catch(() => setFileError("读取失败，请将 CSV 另存为 UTF-8 编码再试。"));
+            }}
+          />
+        </Field>
+        {fileError && (
+          <p className="inline-warning" role="alert">
+            {fileError}
+          </p>
+        )}
+        <Field label="CSV 内容" hint="必填排名、书名。可加作者、题材、字数、在读、状态、标签、链接。">
           <Textarea
             rows={12}
             value={rankingCsv}
@@ -48,7 +80,7 @@ export function RankingImportModal({
           <Button variant="secondary" onClick={onClose}>
             取消
           </Button>
-          <Button disabled={!rankingCsv.trim()} onClick={onSave}>
+          <Button disabled={!rankingName.trim() || !rankingCsv.trim()} onClick={onSave}>
             保存快照
           </Button>
         </div>
@@ -57,77 +89,108 @@ export function RankingImportModal({
   );
 }
 
+export type RankingSourceKind = "inbox" | "https";
+
+interface RankingSourceFieldsProps {
+  kind: RankingSourceKind;
+  value: string;
+  name: string;
+  workspace: string;
+  onKindChange: (value: RankingSourceKind) => void;
+  onValueChange: (value: string) => void;
+  onNameChange: (value: string) => void;
+}
+
+function RankingSourceFields({
+  kind,
+  value,
+  name,
+  workspace,
+  onKindChange,
+  onValueChange,
+  onNameChange,
+}: RankingSourceFieldsProps) {
+  return (
+    <>
+      <div className="form-grid two">
+        <Field label="榜单名称">
+          <Input
+            value={name}
+            maxLength={200}
+            placeholder="如番茄男频·都市脑洞阅读榜"
+            onChange={(event) => onNameChange(event.target.value)}
+          />
+        </Field>
+        <Field label="数据源类型">
+          <Select value={kind} onChange={(event) => onKindChange(event.target.value as RankingSourceKind)}>
+            <option value="inbox">本地 CSV 收件箱</option>
+            <option value="https">已授权的 HTTPS CSV</option>
+          </Select>
+        </Field>
+      </div>
+      <Field
+        label={kind === "inbox" ? "CSV 文件名" : "CSV 地址"}
+        hint={
+          kind === "inbox"
+            ? "将 UTF-8 CSV 放进工作区的 rank-inbox 文件夹，再填文件名。"
+            : "填写你有权定时读取、可直接下载 UTF-8 CSV 的 HTTPS 地址。"
+        }
+      >
+        <Input
+          value={value}
+          maxLength={kind === "inbox" ? 200 : 2000}
+          placeholder={kind === "inbox" ? "男频阅读榜.csv" : "https://example.com/rank.csv"}
+          onChange={(event) => onValueChange(event.target.value)}
+        />
+      </Field>
+      {kind === "inbox" && workspace && (
+        <code className={styles.inboxPath}>{`${workspace.replace(/[\\/]$/, "")}\\rank-inbox`}</code>
+      )}
+    </>
+  );
+}
+
 interface PublicRankingModalProps {
   open: boolean;
-  gender: FanqieGender;
-  rankKind: FanqieRankKind;
-  categoryId: string;
-  rankingName: string;
-  publicUrl: string;
-  onSelectRanking: (gender: FanqieGender, kind: FanqieRankKind, categoryId: string) => void;
-  onRankingNameChange: (value: string) => void;
+  fields: RankingSourceFieldsProps;
+  ready: boolean;
+  busy: boolean;
+  dailySync: boolean;
+  onDailySyncChange: (value: boolean) => void;
   onClose: () => void;
   onCapture: () => void;
 }
 
 function PublicRankingModal({
   open,
-  gender,
-  rankKind,
-  categoryId,
-  rankingName,
-  publicUrl,
-  onSelectRanking,
-  onRankingNameChange,
+  fields,
+  ready,
+  busy,
+  dailySync,
+  onDailySyncChange,
   onClose,
   onCapture,
 }: PublicRankingModalProps) {
   if (!open) return null;
-  const categories = FANQIE_CATEGORIES[gender];
   return (
-    <Modal title="采集番茄公开榜单" onClose={onClose}>
+    <Modal title="同步榜单源" onClose={() => !busy && onClose()}>
       <div className="form-stack">
-        <div className={`form-grid ${styles.fanqieRankingFilters}`}>
-          <Field label="频道">
-            <Select
-              value={gender}
-              onChange={(event) => onSelectRanking(event.target.value as FanqieGender, rankKind, "")}
-            >
-              <option>男频</option>
-              <option>女频</option>
-            </Select>
-          </Field>
-          <Field label="榜型">
-            <Select
-              value={rankKind}
-              onChange={(event) => onSelectRanking(gender, event.target.value as FanqieRankKind, categoryId)}
-            >
-              <option>阅读榜</option>
-              <option>新书榜</option>
-            </Select>
-          </Field>
-          <Field label="题材">
-            <Select value={categoryId} onChange={(event) => onSelectRanking(gender, rankKind, event.target.value)}>
-              {categories.map(([id, name]) => (
-                <option key={id} value={id}>
-                  {name}
-                </option>
-              ))}
-            </Select>
-          </Field>
-        </div>
-        <Field label="榜单名称">
-          <Input value={rankingName} onChange={(event) => onRankingNameChange(event.target.value)} />
-        </Field>
-        <p className="inline-warning">
-          每次最多读取前 20 本的公开元数据与官方链接。系统不下载正文，不携带 Cookie，也不绕过登录、验证或访问限制。
-        </p>
+        <RankingSourceFields {...fields} />
+        <label className="check-row">
+          <input
+            type="checkbox"
+            checked={dailySync}
+            disabled={busy}
+            onChange={(event) => onDailySyncChange(event.target.checked)}
+          />
+          <span>每日自动更新</span>
+        </label>
         <div className="modal-actions">
-          <Button variant="secondary" onClick={onClose}>
+          <Button variant="secondary" disabled={busy} onClick={onClose}>
             取消
           </Button>
-          <Button disabled={!/^https?:\/\//.test(publicUrl)} onClick={onCapture}>
-            开始采集
+          <Button disabled={!ready || busy} onClick={onCapture}>
+            {busy ? "正在同步…" : dailySync ? "立即同步并开启每日更新" : "立即同步"}
           </Button>
         </div>
       </div>
@@ -137,10 +200,12 @@ function PublicRankingModal({
 
 interface RankingScheduleModalProps {
   open: boolean;
-  rankingName: string;
-  publicUrl: string;
+  fields: RankingSourceFieldsProps;
+  ready: boolean;
+  busy: boolean;
   frequency: RankingCaptureSchedule["frequency"];
   schedules: RankingCaptureSchedule[];
+  runningId: string | null;
   onFrequencyChange: (value: RankingCaptureSchedule["frequency"]) => void;
   onClose: () => void;
   onAdd: () => void;
@@ -151,10 +216,12 @@ interface RankingScheduleModalProps {
 
 function RankingScheduleModal({
   open,
-  rankingName,
-  publicUrl,
+  fields,
+  ready,
+  busy,
   frequency,
   schedules,
+  runningId,
   onFrequencyChange,
   onClose,
   onAdd,
@@ -164,24 +231,26 @@ function RankingScheduleModal({
 }: RankingScheduleModalProps) {
   if (!open) return null;
   return (
-    <Modal title="定时采集番茄榜单" onClose={onClose} width={720}>
+    <Modal title="定时采榜" onClose={onClose} width={720}>
       <div className="form-stack">
+        <RankingSourceFields {...fields} />
         <div className={styles.scheduleCreateRow}>
-          <span>
-            <strong>{rankingName}</strong>
-            <small>{publicUrl}</small>
-          </span>
-          <Select
-            value={frequency}
-            onChange={(event) => onFrequencyChange(event.target.value as RankingCaptureSchedule["frequency"])}
-          >
-            <option>每日</option>
-            <option>每周</option>
-          </Select>
-          <Button onClick={onAdd}>添加任务</Button>
+          <Field label="频率">
+            <Select
+              value={frequency}
+              onChange={(event) => onFrequencyChange(event.target.value as RankingCaptureSchedule["frequency"])}
+            >
+              <option>每日</option>
+              <option>每周</option>
+            </Select>
+          </Field>
+          <Button disabled={!ready || busy} onClick={onAdd}>
+            {busy ? "正在保存…" : "添加任务"}
+          </Button>
         </div>
         <p className="inline-warning">
-          仅在桌面应用运行时检查任务；失败会记录并顺延到下一周期，不会绕过验证或访问限制。
+          每日任务按北京时间 15:20 排程。应用运行时每 15 分钟检查；当天过点打开会补跑一次。
+          使用本地收件箱的任务会读取同名 CSV，有新一期数据时需更新文件并填写新的榜单版本。同一期不会重复入库。
         </p>
         <div className={styles.rankingScheduleList}>
           {schedules.length ? (
@@ -190,7 +259,9 @@ function RankingScheduleModal({
                 <div>
                   <strong>{schedule.listName}</strong>
                   <small>
-                    {schedule.frequency} · 下次 {formatDate(schedule.nextRunAt, true)}
+                    {schedule.frequency} ·{" "}
+                    {schedule.url.startsWith("inbox:") ? `收件箱 ${schedule.url.slice(6)}` : "HTTPS 来源"} · 下次{" "}
+                    {beijingTime.format(new Date(schedule.nextRunAt))} 北京时间
                   </small>
                   {schedule.lastError && <small className={styles.errorText}>{schedule.lastError}</small>}
                 </div>
@@ -214,6 +285,7 @@ function RankingScheduleModal({
                   className="icon-button"
                   title="立即运行"
                   aria-label="立即运行"
+                  disabled={runningId !== null}
                   onClick={() => onRun(schedule)}
                 >
                   <Play size={15} />
@@ -230,7 +302,7 @@ function RankingScheduleModal({
               </article>
             ))
           ) : (
-            <p className="muted-line">还没有定时任务。上方会按当前频道、榜型和题材创建任务。</p>
+            <p className="muted-line">还没有定时任务。</p>
           )}
         </div>
       </div>

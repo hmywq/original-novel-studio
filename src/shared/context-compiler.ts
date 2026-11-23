@@ -1,4 +1,5 @@
 import { compileAestheticGuidance } from "./aesthetic-profile";
+import { buildChapterContinuityContext, type ContinuitySource } from "./chapter-continuity";
 import { compileChapterGuidance, resolveStoryStage } from "./commercial-knowledge";
 import { contextBudgetTokens, DEFAULT_CLOUD_CONTEXT_WINDOW, scaledCap } from "./context-budget";
 import { buildContextDiagnostics, type ContextContentKey } from "./context-diagnostics";
@@ -11,6 +12,7 @@ import { findCurrentVolume } from "./planning";
 import { analyzeProseTemperature } from "./prose-temperature";
 import { evaluateStoryConstraints } from "./story-constraints";
 import { renderStoryEntryLine, selectStoryEntriesForChapter, storyEntryProperNouns } from "./story-entry-service";
+import { isStudioFormat } from "./studio-format";
 import { buildLongTermMemory } from "./summaries";
 import { estimateStructuredRequestTokens } from "./token-estimator";
 import type {
@@ -27,7 +29,8 @@ import type {
   StorySummary,
 } from "./types";
 
-export type ContextChapterExcerpt = Pick<Chapter, "number" | "title" | "outline" | "content">;
+export type ContextChapterExcerpt = Pick<Chapter, "number" | "title" | "outline" | "content"> &
+  Partial<Pick<Chapter, "id" | "status">>;
 
 export interface ContextCompilerInput {
   summary: Pick<ProjectSummary, "genre" | "currentWords" | "targetWords"> & { wordsPerChapter?: number };
@@ -158,6 +161,11 @@ export function compileChapterContext(
     .filter((item) => item.number < chapter.number)
     .sort((left, right) => left.number - right.number);
   const recent = priorChapters.slice(-recentSummaryLimit);
+  const continuity = buildChapterContinuityContext(
+    { summary, contract, plans: input.plans, chapters: input.recentChapters },
+    chapter,
+    budgetTokens,
+  );
   const styleSamples = input.styleSamples.filter(Boolean).slice(-STYLE_SAMPLE_LIMIT);
   const ownText = styleSamples.join("\n");
   const sentences = ownText.split(/[。！？!?]/).filter(Boolean);
@@ -206,6 +214,7 @@ export function compileChapterContext(
   const activeFacts = input.relevantFacts.filter(
     (fact) =>
       fact.confidence === "已确认" &&
+      fact.evidenceChapter <= chapter.number &&
       fact.validFromChapter <= chapter.number &&
       (fact.validToChapter === null || fact.validToChapter >= chapter.number),
   );
@@ -245,9 +254,26 @@ export function compileChapterContext(
       : contractList(label, items);
   const expectationLine = (item: ExpectationEntry, prefix: string) =>
     `[${prefix}] ${item.title}｜第${item.sourceChapter}章提出｜预计第${item.expectedPayoffChapter ?? "未定"}章兑现｜${item.status}`;
+  const factSources: ContinuitySource[] = rankFacts(activeFacts, chapterBrief)
+    .slice(0, factLimit)
+    .map((fact) => ({
+      id: `fact:${fact.id}`,
+      kind: "已确认事实",
+      chapterNumber: fact.evidenceChapter,
+      authority: "已确认",
+      text: `[${fact.genreDimension || fact.kind}] ${fact.subject}｜${fact.predicate}｜${fact.value}（自第${fact.validFromChapter}章）`,
+    }));
+  const entrySources: ContinuitySource[] = entrySelection.selected.map((item) => ({
+    id: `entry:${item.entry.id}`,
+    kind: "作者设定",
+    chapterNumber: null,
+    authority: "已确认",
+    text: renderStoryEntryLine(item),
+  }));
 
   const context: ContextPackage = {
     contract: [
+      ...(contract.approved ? ["[来源 contract:approved｜作者已批准设定]"] : []),
       `故事前提：${contract.premise}`,
       `题材子类型：${contract.genreSubtype || "未选择"}`,
       `复合叙事类型：${contract.secondaryGenres?.join(" + ") || "未选择"}`,
@@ -335,15 +361,10 @@ export function compileChapterContext(
           )?.content ?? `第${item.number}章 ${item.title}：${item.outline || item.content.slice(0, 180)}`,
       )
       .join("\n"),
-    relevantFacts: rankFacts(activeFacts, chapterBrief)
-      .slice(0, factLimit)
-      .map(
-        (fact) =>
-          `[${fact.genreDimension || fact.kind}] ${fact.subject}｜${fact.predicate}｜${fact.value}（自第${fact.validFromChapter}章）`,
-      )
-      .join("\n"),
-    storyEntries: entrySelection.selected.length
-      ? entrySelection.selected.map((item) => renderStoryEntryLine(item)).join("\n")
+    continuity: continuity.text,
+    relevantFacts: factSources.map((source) => `[来源 ${source.id}｜已确认事实] ${source.text}`).join("\n"),
+    storyEntries: entrySources.length
+      ? entrySources.map((source) => `[来源 ${source.id}｜作者设定] ${source.text}`).join("\n")
       : storyEntries.length
         ? "本章未命中任何设定条目"
         : "尚未建立设定条目（可在故事圣经「设定条目」生成）",
@@ -364,6 +385,14 @@ export function compileChapterContext(
         : "尚无本项目已定稿正文，不加载任何样本文风。",
     ].join("\n"),
     guidanceMode: normalizeGuidanceMode(contract.guidanceMode),
+    ...(isStudioFormat(contract.lengthShape)
+      ? {
+          studio: {
+            format: contract.lengthShape,
+            targetChapters: Math.ceil(summary.targetWords / (summary.wordsPerChapter || 2500)),
+          },
+        }
+      : {}),
     estimatedTokens: 0,
   };
   context.estimatedTokens = estimateStructuredRequestTokens([
@@ -372,6 +401,23 @@ export function compileChapterContext(
     chapter.chapterFunction ?? "行动",
   ]);
   const trimmedSections = applyContextBudget(context, budgetTokens);
+  // 校验只能看实际入模的文本；被整体裁掉的段不保留可用引用元数据。
+  context.continuitySources = [
+    ...(contract.approved && context.contract.trim()
+      ? [
+          {
+            id: "contract:approved",
+            kind: "作者设定" as const,
+            chapterNumber: null,
+            authority: "已确认" as const,
+            text: context.contract,
+          },
+        ]
+      : []),
+    ...factSources.filter((source) => context.relevantFacts.includes(source.text)),
+    ...entrySources.filter((source) => context.storyEntries.includes(source.text)),
+    ...continuity.sources.filter((source) => context.continuity?.includes(source.text)),
+  ];
 
   const confirmedConflicts = input.constraintFacts.filter((fact) => fact.confidence === "有冲突");
   const constraintFindings = evaluateStoryConstraints(input.constraintFacts, chapter);
@@ -394,6 +440,10 @@ export function compileChapterContext(
       volumeGoal: { includedItems: volume ? 1 : 0, totalItems: 1 },
       rollingOutline: { includedItems: rolling.length, totalItems: rollingCandidates.length },
       recentSummary: { includedItems: recent.length, totalItems: priorChapters.length },
+      continuity: {
+        includedItems: context.continuity ? continuity.includedChapters.length : 0,
+        totalItems: priorChapters.filter((item) => item.content.trim()).length,
+      },
       relevantFacts: { includedItems: Math.min(factLimit, activeFacts.length), totalItems: activeFacts.length },
       storyEntries: { includedItems: entrySelection.selected.length, totalItems: entrySelection.total },
       forbiddenKnowledge: { includedItems: secrets.length, totalItems: secrets.length },
@@ -402,6 +452,7 @@ export function compileChapterContext(
     [
       trimmedSections.length ? `已按 token 预算裁剪：${trimmedSections.join("、")}` : "",
       entrySelection.omitted > 0 ? `设定条目按预算省略 ${entrySelection.omitted} 条` : "",
+      `前文承接：已含第 ${context.continuity ? continuity.includedChapters.join("、") || "无" : "无"} 章原文；待审前文不自动确认为事实；${continuity.truncated || !context.continuity ? "片段已按预算截断或省略" : "无截断"}；上限 ${Math.min(3000, Math.max(0, Math.floor(budgetTokens * 0.25)))} token`,
       `上下文预算 ${budgetTokens} token（模型窗口 ${windowTokens}，近 ${recentSummaryLimit} 章摘要、前瞻 ${rollingChapterWindow} 章章纲）`,
       contractListOmitted > 0 ? `契约长列表已按预算截断 ${contractListOmitted} 条，完整内容见故事圣经` : "",
       !contract.approved ? "创作契约尚未审批，生成门禁应阻止使用未确认方向" : "",
@@ -427,6 +478,7 @@ const TRIM_ORDER = [
   "authorStyle",
   "longTermMemory",
   "recentSummary",
+  "continuity",
   "relevantFacts",
   "storyEntries",
   "expectationLedger",
@@ -437,7 +489,7 @@ function applyContextBudget(context: ContextPackage, budgetTokens: number): Cont
   const trimmed: ContextContentKey[] = [];
   for (const key of TRIM_ORDER) {
     if (context.estimatedTokens <= budgetTokens) break;
-    if (!context[key].trim()) continue;
+    if (!context[key]?.trim()) continue;
     context[key] = "";
     trimmed.push(key);
     context.estimatedTokens = estimateStructuredRequestTokens([contextText(context)]);
@@ -453,6 +505,7 @@ const CONTEXT_SECTION_TITLES = {
   volumeGoal: "当前卷目标",
   expectationLedger: "跨章期待",
   recentSummary: "近期摘要",
+  continuity: "跨章承接与连续性依据",
   longTermMemory: "长期记忆",
   relevantFacts: "相关事实",
   storyEntries: "设定条目",

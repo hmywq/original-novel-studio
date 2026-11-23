@@ -151,6 +151,46 @@ describe("来源模型清单", () => {
     expect(database.listModelCapabilities("p-404")).toEqual([]);
   });
 
+  it("匿名查询 APIGoto 公开目录并按可调用的 model_id 去重", async () => {
+    const database = createDatabase();
+    const id = "p-apigoto";
+    database.saveAiProfile(
+      profile({
+        id,
+        baseUrl: "https://api.apigoto.com/v1",
+        extraHeaders: { "X-Custom-Header": "custom" },
+        extraQuery: { tenant: "custom" },
+      }),
+    );
+    const enabled = { model_id: "gpt-6.1-sol", status: "enabled", client_visible: true };
+    fetchPublicHttpResponse.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          code: 0,
+          data: [
+            { id: 1, ...enabled },
+            { id: 2, ...enabled },
+            { id: 3, ...enabled, model_id: "hidden", client_visible: false },
+            { id: 4, ...enabled, model_id: "disabled", status: "disabled" },
+          ],
+        }),
+      ),
+    );
+
+    const handlers = createHandlers(database);
+    const refresh = handlers.get("refreshAiProfileModels") as (id: string, force?: boolean) => Promise<string[]>;
+    const list = handlers.get("listAiProfileModels") as (id: string) => AiProfileModelOption[];
+
+    expect(await refresh(id, true)).toEqual(["gpt-6.1-sol"]);
+    expect(await refresh(id)).toEqual(["gpt-6.1-sol"]);
+    expect(fetchPublicHttpResponse).toHaveBeenCalledOnce();
+    expect(fetchPublicHttpResponse).toHaveBeenCalledWith(
+      "https://api.apigoto.com/api/v1/user/user/models",
+      expect.objectContaining({ headers: { Accept: "application/json" } }),
+    );
+    expect(list(id)).toContainEqual(expect.objectContaining({ modelId: "gpt-6.1-sol", source: "provider-catalog" }));
+  });
+
   it("保存来源后允许立刻重试清单", async () => {
     const database = createDatabase();
     database.saveAiProfile(profile({ id: "p-save" }));

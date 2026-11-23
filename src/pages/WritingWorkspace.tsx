@@ -9,6 +9,7 @@ import {
   MessageSquareText,
   Plus,
   Save,
+  ScanText,
   Search,
   SearchCheck,
   Sparkles,
@@ -29,6 +30,7 @@ import { useNavigationGuard } from "../lib/navigation-guard";
 import type { AiProfileView } from "../shared/ai/types";
 import { canAcceptGeneratedDraft, summarizeQualityOverview } from "../shared/generated-review";
 import type { GenerationQuality } from "../shared/generation-quality";
+import { inspectManuscriptStyle, type ManuscriptStyleHint } from "../shared/manuscript-style";
 import { diffParagraphs } from "../shared/paragraph-diff";
 import { buildChapterSummary } from "../shared/summaries";
 import { TOKEN_ESTIMATE_WARNING } from "../shared/token-estimator";
@@ -48,6 +50,8 @@ import type {
 import { CHAPTER_FUNCTIONS } from "../shared/types";
 import { ContextPanel } from "./ContextPanel";
 import { DirectorNotesEditor } from "./DirectorNotesEditor";
+import { ManuscriptStyleReview } from "./ManuscriptStyleReview";
+import manuscriptStyles from "./ManuscriptStyleReview.module.css";
 
 export interface CommonProjectProps {
   project: ProjectDetail;
@@ -76,6 +80,90 @@ const EMPTY_CHAPTER = (number: number): Chapter => ({
   revision: 0,
   updatedAt: new Date().toISOString(),
 });
+
+type RevisionSelection = { start: number; end: number; text: string };
+
+function sameManuscript(snapshot: Chapter, current: Chapter) {
+  return snapshot.id === current.id && snapshot.number === current.number && snapshot.content === current.content;
+}
+
+function canAdoptCheckedDraft(chapter: Chapter, issues: readonly QualityIssue[]) {
+  const status = chapter.qualityCheck?.status;
+  const complete = status === "已通过" || status === "有冲突";
+  return complete && canAcceptGeneratedDraft(issues.filter((issue) => issue.status === "待处理"));
+}
+
+function displayedQualityStatus(chapter: Chapter) {
+  const status = chapter.qualityCheck?.status;
+  return !status || status === "检查中" ? "未完成检查" : status;
+}
+
+function ContinuityEvidenceView({ issue, project }: { issue: QualityIssue; project: ProjectDetail }) {
+  const evidence = issue.continuityEvidence;
+  if (!evidence) return null;
+  const priorChapter = project.chapters.find(
+    (chapter) =>
+      evidence.sourceId === `chapter:${chapter.id}` ||
+      evidence.sourceId.startsWith(`chapter:${chapter.id}:`) ||
+      evidence.sourceId === `opening:${chapter.id}`,
+  );
+  const fact = project.facts.find((item) => evidence.sourceId === `fact:${item.id}`);
+  const source = priorChapter
+    ? `第${priorChapter.number}章`
+    : fact
+      ? `已确认事实 · 第${fact.evidenceChapter}章`
+      : "已提供的前文或作者设定";
+  return (
+    <div style={{ marginTop: 6, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+      <small>前文依据 · {source}</small>
+      <blockquote style={{ margin: "4px 0 8px 12px" }}>{evidence.previousQuote}</blockquote>
+      <small>本章证据</small>
+      <blockquote style={{ margin: "4px 0 8px 12px" }}>{evidence.currentQuote}</blockquote>
+    </div>
+  );
+}
+
+function manuscriptSourceOffset(content: string, textareaOffset: number) {
+  let offset = textareaOffset;
+  for (const match of content.matchAll(/\r\n/g)) {
+    if (match.index >= offset) break;
+    offset += 1;
+  }
+  return offset;
+}
+
+function revealManuscriptSelection(editor: HTMLTextAreaElement, start: number, end: number) {
+  editor.setSelectionRange(start, end);
+  editor.focus();
+  if (editor.scrollHeight <= editor.clientHeight) return;
+
+  // textarea 选区不会自动滚动。用相同排版测量选区所在行，计入自动折行。
+  const style = getComputedStyle(editor);
+  const mirror = document.createElement("div");
+  Object.assign(mirror.style, {
+    position: "fixed",
+    left: "-10000px",
+    top: "0",
+    visibility: "hidden",
+    boxSizing: "border-box",
+    width: `${editor.clientWidth}px`,
+    padding: style.padding,
+    font: style.font,
+    lineHeight: style.lineHeight,
+    letterSpacing: style.letterSpacing,
+    whiteSpace: style.whiteSpace,
+    overflowWrap: style.overflowWrap,
+    wordBreak: style.wordBreak,
+    tabSize: style.tabSize,
+  });
+  const marker = document.createElement("span");
+  marker.textContent = editor.value.slice(start, start + 2);
+  mirror.append(editor.value.slice(0, start), marker);
+  document.body.append(mirror);
+  const offset = marker.getBoundingClientRect().top - mirror.getBoundingClientRect().top;
+  mirror.remove();
+  editor.scrollTop = Math.max(0, offset - editor.clientHeight / 4);
+}
 
 export function WritingPage({
   project,
@@ -122,7 +210,15 @@ export function WritingPage({
     issues: QualityIssue[];
     observations: string[];
     checking: boolean;
+    checkLoadError?: string;
   } | null>(null);
+  const [qualityChecking, setQualityChecking] = useState(false);
+  const [qualityReport, setQualityReport] = useState<{
+    chapterId: string;
+    issues: QualityIssue[];
+    observations: string[];
+  } | null>(null);
+  const [qualityFailure, setQualityFailure] = useState<{ chapterId: string; reason: string } | null>(null);
   const [revertNote, setRevertNote] = useState("");
   const [reviewSelectionText, setReviewSelectionText] = useState("");
   const [reviewContext, setReviewContext] = useState<ContextPackage | null>(null);
@@ -144,12 +240,29 @@ export function WritingPage({
     observations: string[];
     checking: boolean;
     adopted: boolean;
+    checkLoadError?: string;
   }> | null>(null);
+  const [batchPauseReason, setBatchPauseReason] = useState<string | null>(null);
+  useEffect(() => {
+    const pendingIssues = (chapterId: string) =>
+      project.issues.filter((issue) => issue.chapterId === chapterId && issue.status === "待处理");
+    setReview((current) => (current ? { ...current, issues: pendingIssues(current.chapter.id) } : current));
+    setBatchReview(
+      (current) => current?.map((item) => ({ ...item, issues: pendingIssues(item.chapter.id) })) ?? current,
+    );
+    setQualityReport((current) => (current ? { ...current, issues: pendingIssues(current.chapterId) } : current));
+  }, [project.issues]);
   const [revisionOpen, setRevisionOpen] = useState(false);
   const [revisionBusy, setRevisionBusy] = useState(false);
   const [revisionProposal, setRevisionProposal] = useState<NovelRevisionProposal | null>(null);
   const [selectedRepairIds, setSelectedRepairIds] = useState<string[]>([]);
-  const [revisionSelection, setRevisionSelection] = useState({ start: 0, end: 0, text: "" });
+  const [revisionSelection, setRevisionSelection] = useState<RevisionSelection>({ start: 0, end: 0, text: "" });
+  const [revisionStyleSource, setRevisionStyleSource] = useState<Chapter | null>(null);
+  const [styleReview, setStyleReview] = useState<{
+    chapter: Chapter;
+    whitelistKey: string;
+    hints: ManuscriptStyleHint[];
+  } | null>(null);
   const [revisionInput, setRevisionInput] = useState<{
     instruction: string;
     authority: NovelRevisionAuthority;
@@ -249,6 +362,7 @@ export function WritingPage({
       .then((loaded) => {
         if (chapterRequestRef.current !== requestId) return;
         const recovered = readRecoveredChapter(project.summary.id, loaded);
+        setQualityFailure((failure) => (failure?.chapterId === loaded.id ? null : failure));
         draftRef.current = recovered;
         setDraft(recovered);
         lastSavedSignature.current = chapterDraftSignature(loaded);
@@ -282,8 +396,27 @@ export function WritingPage({
   }, [active, project.summary.id, registerLeaveGuard]);
   const draftSignature = useMemo(() => chapterDraftSignature(draft), [draft]);
   const dirty = draftSignature !== lastSavedSignature.current;
+  const currentQualityIssues =
+    qualityReport?.chapterId === draft.id
+      ? qualityReport.issues
+      : project.issues.filter((issue) => issue.chapterId === draft.id && issue.status === "待处理");
+  const currentQualityObservations =
+    qualityReport?.chapterId === draft.id ? qualityReport.observations : (draft.qualityCheck?.observations ?? []);
+  const currentQualityFailure = qualityFailure?.chapterId === draft.id ? qualityFailure.reason : null;
+  const qualityStatus = qualityChecking
+    ? "检查中"
+    : dirty || currentQualityFailure
+      ? "未完成检查"
+      : displayedQualityStatus(draft);
+  const qualityReason = dirty
+    ? "稿件已修改，请重新运行质检。"
+    : (currentQualityFailure ??
+      draft.qualityCheck?.reason ??
+      (draft.qualityCheck?.status === "检查中"
+        ? "上次检查没有完整结束，请手动运行质检。"
+        : "尚未完成检查，请运行质检。"));
   useEffect(() => {
-    if (busy || chapterLoading) return;
+    if (busy || chapterLoading || revisionBusy) return;
     if (!dirty) {
       setSaveStatus("saved");
       return;
@@ -304,7 +437,7 @@ export function WritingPage({
       if (timer) window.clearTimeout(timer);
       window.clearTimeout(recoveryTimer);
     };
-  }, [busy, chapterLoading, dirty, draft, project.summary.id]);
+  }, [busy, chapterLoading, dirty, draft, project.summary.id, revisionBusy]);
   useEffect(() => {
     const preventUnsavedExit = (event: BeforeUnloadEvent) => {
       if (chapterDraftSignature(draftRef.current) === lastSavedSignature.current) return;
@@ -405,6 +538,53 @@ export function WritingPage({
     if (!snapshot.id) await reload();
     return saved;
   };
+  const openRevision = (selection: RevisionSelection, styleHint?: ManuscriptStyleHint) => {
+    setRevisionSelection(selection);
+    setRevisionInput((current) =>
+      styleHint
+        ? {
+            instruction: `请复核选区中的${styleHint.labels.join("、")}。保留情节、视角和人物口吻，只调整有必要的表达。`,
+            authority: "设定为准",
+            scope: "仅选区",
+          }
+        : {
+            ...current,
+            instruction: revisionStyleSource ? "" : current.instruction,
+            scope: selection.text ? "仅选区" : "当前章节",
+          },
+    );
+    setRevisionStyleSource(styleHint ? draftRef.current : null);
+    setRevisionProposal(null);
+    setSelectedRepairIds([]);
+    setRevisionOpen(true);
+  };
+  const assertStyleRevisionCurrent = () => {
+    if (revisionStyleSource && !sameManuscript(revisionStyleSource, draftRef.current))
+      throw new Error("文风修订的正文已更新，请重新检查并选择要修改的段落");
+  };
+  const refreshStyleReview = () => {
+    const chapter = draftRef.current;
+    const whitelist = project.aiFlavorWhitelist ?? [];
+    setStyleReview({
+      chapter,
+      whitelistKey: JSON.stringify(whitelist),
+      hints: inspectManuscriptStyle(chapter.content, whitelist),
+    });
+  };
+  const styleSelection = (hint: ManuscriptStyleHint): RevisionSelection | null => {
+    const chapter = draftRef.current;
+    if (!styleReview || !sameManuscript(styleReview.chapter, chapter)) return null;
+    return { start: hint.start, end: hint.end, text: chapter.content.slice(hint.start, hint.end) };
+  };
+  const locateStyleHint = (hint: ManuscriptStyleHint) => {
+    const editor = manuscriptRef.current;
+    const selection = styleSelection(hint);
+    if (!editor || !selection) return;
+    // textarea 会把 Windows 换行归一为 LF，修订请求始终使用原稿偏移。
+    const start = draftRef.current.content.slice(0, selection.start).replace(/\r\n/g, "\n").length;
+    const end = start + selection.text.replace(/\r\n/g, "\n").length;
+    revealManuscriptSelection(editor, start, end);
+  };
   const captureReviewSelection = () => {
     const selection = window.getSelection();
     const text = selection ? selection.toString() : "";
@@ -418,16 +598,13 @@ export function WritingPage({
       notify("未能在正文中定位所选文字，请改选或使用整章修改意见", "error");
       return;
     }
-    setRevisionSelection({ start: index, end: index + reviewSelectionText.length, text: reviewSelectionText });
-    setRevisionInput((current) => ({ ...current, scope: "仅选区" }));
-    setRevisionProposal(null);
-    setSelectedRepairIds([]);
+    openRevision({ start: index, end: index + reviewSelectionText.length, text: reviewSelectionText });
     setReviewSelectionText("");
     setReview(null);
-    setRevisionOpen(true);
   };
   const acceptGeneratedDraft = async () => {
-    if (!review) return;
+    if (!review || review.checking || review.checkLoadError || !canAdoptCheckedDraft(review.chapter, review.issues))
+      return;
     try {
       setBusy(true);
       await api.transitionChapter(project.summary.id, review.chapter.id, "待定稿");
@@ -441,6 +618,24 @@ export function WritingPage({
         draftRef.current = { ...draftRef.current, status: "待定稿" };
         setDraft({ ...draftRef.current, status: "待定稿" });
       }
+    } catch (error) {
+      notify(describeError(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const adoptCurrentCheckedDraft = async () => {
+    if (busy || dirty || currentQualityFailure || !canAdoptCheckedDraft(draftRef.current, currentQualityIssues)) return;
+    setBusy(true);
+    try {
+      const result = await api.transitionChapter(project.summary.id, draftRef.current.id, "待定稿");
+      const accepted = { ...draftRef.current, status: result.chapter.status };
+      draftRef.current = accepted;
+      setDraft(accepted);
+      lastSavedSignature.current = chapterDraftSignature(accepted);
+      void api.recordGenerationDecision(project.summary.id, accepted.id, "adopted");
+      await reload();
+      notify("已采纳本章并进入待定稿");
     } catch (error) {
       notify(describeError(error), "error");
     } finally {
@@ -492,6 +687,8 @@ export function WritingPage({
     }
   };
   const adoptBatchChapter = async (chapterId: string) => {
+    const item = batchReview?.find((entry) => entry.chapter.id === chapterId);
+    if (!item || item.checking || item.checkLoadError || !canAdoptCheckedDraft(item.chapter, item.issues)) return;
     try {
       await api.transitionChapter(project.summary.id, chapterId, "待定稿");
       void api.recordGenerationDecision(project.summary.id, chapterId, "adopted");
@@ -536,6 +733,7 @@ export function WritingPage({
     lastSavedSignature.current = chapterDraftSignature(chapter);
     setSaveStatus("saved");
     setContext(null);
+    setStyleReview(null);
   };
   const selectRelativeChapter = (delta: number) => {
     const chapters = project.chapters;
@@ -560,6 +758,7 @@ export function WritingPage({
     setSaveStatus(recoveredDraft ? "dirty" : "saved");
     setRecoveryAvailable(recoveredDraft);
     setContext(null);
+    setStyleReview(null);
     if (recoveredDraft) notify("已恢复上次未保存的新章草稿");
   };
   const endingToInherit = previousEndingExpectation(draft, project.chapters);
@@ -589,27 +788,54 @@ export function WritingPage({
     // 新章由 saveLatestForAction 先落库，所以这里不再要求已有 id。
     if (busy || chapterLoading) return;
     setBusy(true);
+    setQualityChecking(true);
+    setQualityFailure(null);
+    let checkingChapterId: string | null = null;
+    let receivedResult = false;
     try {
       const saved = await saveLatestForAction();
-      const review = await api.runQualityCheck(project.summary.id, saved.id, taskOverride);
-      const issues = review.issues;
+      checkingChapterId = saved.id;
+      const result = await api.runQualityCheck(project.summary.id, saved.id, taskOverride);
+      receivedResult = true;
+      const issues = result.issues;
+      const checked = { ...saved, qualityCheck: result.check };
+      draftRef.current = checked;
+      setDraft(checked);
+      lastSavedSignature.current = chapterDraftSignature(checked);
+      setQualityReport({ chapterId: saved.id, issues, observations: result.observations });
       // 只有“草稿/待质检”才推进到待定稿；重复质检不应因状态机报错。
-      const canAdvance = saved.status === "草稿" || saved.status === "待质检";
-      if (canAdvance) await api.transitionChapter(project.summary.id, saved.id, "待定稿");
+      const complete = result.check?.status === "已通过" || result.check?.status === "有冲突";
+      const canAdvance =
+        complete && canAdoptCheckedDraft(checked, issues) && (saved.status === "草稿" || saved.status === "待质检");
+      if (canAdvance) {
+        const transition = await api.transitionChapter(project.summary.id, saved.id, "待定稿");
+        const advanced = { ...transition.chapter, qualityCheck: result.check };
+        draftRef.current = advanced;
+        setDraft(advanced);
+        lastSavedSignature.current = chapterDraftSignature(advanced);
+      }
       await reload();
+      if (!complete) {
+        notify(`未完成检查；草稿已保留。${result.check?.reason ?? "请重新运行质检。"}`, "error");
+        return;
+      }
       const summary = issues.length ? `质检完成，发现 ${issues.length} 项问题` : "质检完成，未发现问题";
-      const observationNote = review.observations.length ? `，另有 ${review.observations.length} 条观察` : "";
+      const observationNote = result.observations.length ? `，另有 ${result.observations.length} 条观察` : "";
       notify(
         canAdvance
           ? `${summary}${observationNote}`
           : `${summary}${observationNote}（当前状态“${saved.status}”，状态未变）`,
       );
     } catch (error) {
+      if (checkingChapterId && !receivedResult) {
+        setQualityFailure({ chapterId: checkingChapterId, reason: `检查未完成：${describeError(error)}` });
+      }
       // 质检可能已经写入问题记录：失败时也要刷新，让问题列表可见。
       await reload().catch(() => undefined);
       notify(describeError(error), "error");
     } finally {
       setBusy(false);
+      setQualityChecking(false);
     }
   };
   const shortcutsRef = useRef({ save, runQualityCheck, selectRelativeChapter, startNewChapter });
@@ -650,7 +876,13 @@ export function WritingPage({
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
   }, [active]);
-  const editorBusy = busy || chapterLoading;
+  const editorBusy = busy || chapterLoading || revisionBusy;
+  const currentStyleHints =
+    styleReview &&
+    sameManuscript(styleReview.chapter, draft) &&
+    styleReview.whitelistKey === JSON.stringify(project.aiFlavorWhitelist ?? [])
+      ? styleReview.hints
+      : null;
   const revisionRepairItems = revisionProposal
     ? [
         ...revisionProposal.contractRepairs.map((item) => ({
@@ -848,14 +1080,10 @@ export function WritingPage({
             icon={<MessageSquareText size={16} />}
             onClick={() => {
               const editor = manuscriptRef.current;
-              const start = editor?.selectionStart ?? 0;
-              const end = editor?.selectionEnd ?? 0;
+              const start = manuscriptSourceOffset(draft.content, editor?.selectionStart ?? 0);
+              const end = manuscriptSourceOffset(draft.content, editor?.selectionEnd ?? 0);
               const text = end > start ? draft.content.slice(start, end) : "";
-              setRevisionSelection({ start, end, text });
-              setRevisionInput((current) => ({ ...current, scope: text ? "仅选区" : "当前章节" }));
-              setRevisionProposal(null);
-              setSelectedRepairIds([]);
-              setRevisionOpen(true);
+              openRevision({ start, end, text });
             }}
           >
             修改意见
@@ -899,6 +1127,8 @@ export function WritingPage({
             icon={<Sparkles size={16} />}
             onClick={async () => {
               let beforeGeneration = draftRef.current;
+              let savedResult: Chapter | null = null;
+              let savedCheckLoaded = false;
               let streamedContent = "";
               let streamedAttempt = 0;
               setBusy(true);
@@ -920,40 +1150,62 @@ export function WritingPage({
                   },
                   taskOverride,
                 );
+                savedResult = result;
+                setQualityFailure(null);
                 draftRef.current = result;
                 lastSavedSignature.current = chapterDraftSignature(result);
                 clearRecoveredChapter(project.summary.id, result);
                 setDraft(result);
                 setSaveStatus("saved");
-                await reload();
                 setReview({
                   chapter: result,
                   previousChapter: beforeGeneration,
                   issues: [],
-                  observations: [],
+                  observations: result.qualityCheck?.observations ?? [],
                   checking: true,
                 });
                 setReviewContext(null);
-                void api
-                  .runQualityCheck(project.summary.id, result.id)
-                  .then((review) =>
-                    setReview((current) =>
-                      current && current.chapter.id === result.id
-                        ? { ...current, issues: review.issues, observations: review.observations, checking: false }
-                        : current,
-                    ),
-                  )
-                  .catch(() =>
-                    setReview((current) =>
-                      current && current.chapter.id === result.id
-                        ? { ...current, issues: [], observations: [], checking: false }
-                        : current,
-                    ),
-                  );
+                // 生成协调器已经完成章后检查；这里只读取保存的结果，不能再次发起审稿。
+                const checkedProject = await api.getProject(project.summary.id);
+                const issues = checkedProject.issues.filter(
+                  (issue) => issue.chapterId === result.id && issue.status === "待处理",
+                );
+                savedCheckLoaded = true;
+                setReview((current) =>
+                  current && current.chapter.id === result.id ? { ...current, issues, checking: false } : current,
+                );
+                setQualityReport({
+                  chapterId: result.id,
+                  issues,
+                  observations: result.qualityCheck?.observations ?? [],
+                });
+                await reload();
               } catch (error) {
-                draftRef.current = beforeGeneration;
-                setDraft(beforeGeneration);
-                notify(describeError(error), "error");
+                if (savedResult) {
+                  const savedChapter = savedResult;
+                  if (!savedCheckLoaded) {
+                    setQualityFailure({
+                      chapterId: savedChapter.id,
+                      reason: "检查结果未能完整载入，请重新打开本章后查看。",
+                    });
+                  }
+                  setReview((current) =>
+                    current && current.chapter.id === savedChapter.id
+                      ? {
+                          ...current,
+                          checking: false,
+                          ...(current.checking
+                            ? { checkLoadError: "检查结果未能完整载入，请重新打开本章后查看。" }
+                            : {}),
+                        }
+                      : current,
+                  );
+                  notify(`草稿已保留；${describeError(error)}`, "error");
+                } else {
+                  draftRef.current = beforeGeneration;
+                  setDraft(beforeGeneration);
+                  notify(describeError(error), "error");
+                }
               } finally {
                 setBusy(false);
               }
@@ -970,7 +1222,7 @@ export function WritingPage({
                 setBusy(true);
                 try {
                   const saved = await saveLatestForAction();
-                  setBatchPreview(await api.previewChapterBatch(project.summary.id, saved.id));
+                  setBatchPreview(await api.previewChapterBatch(project.summary.id, saved.id, taskOverride));
                 } catch (error) {
                   notify(describeError(error), "error");
                 } finally {
@@ -1025,6 +1277,48 @@ export function WritingPage({
           )}
         </div>
         <div className="editor-body">
+          <section className="chapter-intent-panel" aria-label="连续性检查">
+            <strong>连续性检查：{qualityStatus}</strong>
+            {qualityStatus === "未完成检查" && <p className="muted-line">{qualityReason}</p>}
+            {qualityStatus === "检查中" && <p className="muted-line">正在检查当前稿件，结果会保留在本章。</p>}
+            {!review &&
+              !batchReview &&
+              !dirty &&
+              !currentQualityFailure &&
+              (draft.status === "草稿" || draft.status === "待质检") &&
+              canAdoptCheckedDraft(draft, currentQualityIssues) && (
+                <Button
+                  disabled={editorBusy}
+                  icon={<Check size={16} />}
+                  onClick={() => void adoptCurrentCheckedDraft()}
+                >
+                  采纳并进入待定稿
+                </Button>
+              )}
+            {!dirty && currentQualityIssues.some((issue) => issue.continuityEvidence) && (
+              <details>
+                <summary>查看连续性依据</summary>
+                {currentQualityIssues
+                  .filter((issue) => issue.continuityEvidence)
+                  .map((issue) => (
+                    <div key={issue.id}>
+                      <p>{issue.message}</p>
+                      <ContinuityEvidenceView issue={issue} project={project} />
+                    </div>
+                  ))}
+              </details>
+            )}
+            {!dirty && currentQualityObservations.length > 0 && (
+              <details>
+                <summary>观察（不构成问题，也不要求处理）</summary>
+                <ul>
+                  {currentQualityObservations.map((observation) => (
+                    <li key={observation}>{observation}</li>
+                  ))}
+                </ul>
+              </details>
+            )}
+          </section>
           <div className="chapter-intent-panel">
             <div className="intent-panel-head">
               <span>本章意图</span>
@@ -1166,6 +1460,29 @@ export function WritingPage({
               />
             </Field>
           </div>
+          <div className={manuscriptStyles.toolbar}>
+            <Button
+              variant="secondary"
+              icon={<ScanText size={16} />}
+              disabled={editorBusy || (!styleReview && !draft.content.trim())}
+              aria-expanded={Boolean(styleReview)}
+              onClick={() => (styleReview ? setStyleReview(null) : refreshStyleReview())}
+            >
+              文风检查
+            </Button>
+          </div>
+          {styleReview && (
+            <ManuscriptStyleReview
+              hints={currentStyleHints}
+              disabled={editorBusy}
+              onRefresh={refreshStyleReview}
+              onLocate={locateStyleHint}
+              onRevise={(hint) => {
+                const selection = styleSelection(hint);
+                if (selection) openRevision(selection, hint);
+              }}
+            />
+          )}
           <textarea
             ref={manuscriptRef}
             className="manuscript"
@@ -1215,10 +1532,19 @@ export function WritingPage({
       {batchReview && batchReview.length > 0 && (
         <Modal title="审阅五章批次产出" onClose={() => setBatchReview(null)} width={940}>
           <div className="form-stack generated-review">
+            {batchPauseReason && (
+              <p role="status" className="inline-warning">
+                {batchPauseReason}
+              </p>
+            )}
             <p className="muted-line">逐章确认：无硬性问题的章节可采纳进入待定稿；有硬性问题的建议先打回或稍后处理。</p>
             {batchReview.map((item) => {
               const overview = summarizeQualityOverview(item.issues);
-              const adoptable = !item.checking && canAcceptGeneratedDraft(item.issues) && !item.adopted;
+              const adoptable =
+                !item.checking &&
+                !item.checkLoadError &&
+                canAdoptCheckedDraft(item.chapter, item.issues) &&
+                !item.adopted;
               return (
                 <article
                   key={item.chapter.id}
@@ -1231,16 +1557,26 @@ export function WritingPage({
                     <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
                       <small>{formatCount(item.chapter.content.replace(/\s/g, "").length)} 字</small>
                       {item.checking ? (
-                        <Badge tone="neutral">质检中</Badge>
+                        <Badge tone="neutral">载入结果</Badge>
                       ) : item.adopted ? (
                         <Badge tone="success">已采纳</Badge>
                       ) : overview.needsHumanJudgment ? (
                         <Badge tone="danger">有硬性问题</Badge>
+                      ) : !adoptable ? (
+                        <Badge tone="warning">未完成检查</Badge>
                       ) : (
                         <Badge tone="success">可采纳</Badge>
                       )}
                     </span>
                   </div>
+                  <p>连续性检查：{item.checkLoadError ? "未完成检查" : displayedQualityStatus(item.chapter)}</p>
+                  {(item.checkLoadError || item.chapter.qualityCheck?.reason || !item.chapter.qualityCheck) && (
+                    <p className="muted-line">
+                      {item.checkLoadError ??
+                        item.chapter.qualityCheck?.reason ??
+                        "本章尚未完成检查，请返回写作台运行质检。"}
+                    </p>
+                  )}
                   <details>
                     <summary>本章摘要</summary>
                     <pre style={{ whiteSpace: "pre-wrap", fontSize: 12, lineHeight: 1.7 }}>
@@ -1273,10 +1609,21 @@ export function WritingPage({
                             {issue.severity}
                           </Badge>{" "}
                           {issue.message}
+                          <ContinuityEvidenceView issue={issue} project={project} />
                         </li>
                       ))}
                       {item.issues.length > 4 && <li style={{ fontSize: 12 }}>… 共 {item.issues.length} 项</li>}
                     </ul>
+                  )}
+                  {item.observations.length > 0 && (
+                    <details>
+                      <summary>观察（不构成问题，也不要求处理）</summary>
+                      <ul>
+                        {item.observations.map((observation) => (
+                          <li key={observation}>{observation}</li>
+                        ))}
+                      </ul>
+                    </details>
                   )}
                   {!item.checking && (
                     <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 8 }}>
@@ -1315,12 +1662,23 @@ export function WritingPage({
                 disabled={
                   busy ||
                   batchReview.every(
-                    (item) => !(!item.checking && canAcceptGeneratedDraft(item.issues) && !item.adopted),
+                    (item) =>
+                      !(
+                        !item.checking &&
+                        !item.checkLoadError &&
+                        canAdoptCheckedDraft(item.chapter, item.issues) &&
+                        !item.adopted
+                      ),
                   )
                 }
                 onClick={async () => {
                   for (const item of batchReview) {
-                    if (!item.checking && canAcceptGeneratedDraft(item.issues) && !item.adopted)
+                    if (
+                      !item.checking &&
+                      !item.checkLoadError &&
+                      canAdoptCheckedDraft(item.chapter, item.issues) &&
+                      !item.adopted
+                    )
                       await adoptBatchChapter(item.chapter.id);
                   }
                 }}
@@ -1348,12 +1706,23 @@ export function WritingPage({
               <span style={{ display: "inline-flex", alignItems: "center", gap: 10 }}>
                 <small>{formatCount(review.chapter.content.replace(/\s/g, "").length)} 字</small>
                 {!review.checking && (
-                  <Badge tone={canAcceptGeneratedDraft(review.issues) ? "success" : "danger"}>
-                    {canAcceptGeneratedDraft(review.issues) ? "可采纳" : "存在硬性问题"}
+                  <Badge
+                    tone={
+                      !review.checkLoadError && canAdoptCheckedDraft(review.chapter, review.issues)
+                        ? "success"
+                        : "warning"
+                    }
+                  >
+                    {!review.checkLoadError && canAdoptCheckedDraft(review.chapter, review.issues)
+                      ? "可采纳"
+                      : canAcceptGeneratedDraft(review.issues)
+                        ? "未完成检查"
+                        : "存在硬性问题"}
                   </Badge>
                 )}
               </span>
             </div>
+            <p>连续性检查：{review.checkLoadError ? "未完成检查" : displayedQualityStatus(review.chapter)}</p>
             <p className="muted-line">
               AI 正文已写入本章草稿（状态“待质检”）；关闭弹窗不会撤销写入，需要还原请点“打回重写”。
             </p>
@@ -1440,9 +1809,15 @@ export function WritingPage({
             </section>
             <section>
               {review.checking ? (
-                <p className="muted-line">正在运行质检…</p>
+                <p className="muted-line">正在载入已保存的检查结果…</p>
+              ) : review.checkLoadError || displayedQualityStatus(review.chapter) === "未完成检查" ? (
+                <p className="inline-warning">
+                  {review.checkLoadError ??
+                    review.chapter.qualityCheck?.reason ??
+                    "检查尚未完整结束；草稿已保留，请运行质检。"}
+                </p>
               ) : review.issues.length === 0 ? (
-                <p className="muted-line">未发现硬性问题（本地规则未命中，可采纳进入待定稿）</p>
+                <p className="muted-line">本次检查未发现硬性问题，可由作者采纳进入待定稿。</p>
               ) : (
                 <div>
                   <p>
@@ -1461,21 +1836,22 @@ export function WritingPage({
                           {issue.severity}
                         </Badge>{" "}
                         {issue.message}
+                        <ContinuityEvidenceView issue={issue} project={project} />
                       </li>
                     ))}
                   </ul>
-                  {review.observations.length > 0 && (
-                    <div style={{ marginTop: 8 }}>
-                      <p style={{ opacity: 0.8 }}>观察（不构成问题，也不要求处理）</p>
-                      <ul style={{ paddingLeft: 18, marginTop: 4, opacity: 0.8 }}>
-                        {review.observations.map((item) => (
-                          <li key={item} style={{ marginBottom: 4 }}>
-                            {item}
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  )}
+                </div>
+              )}
+              {review.observations.length > 0 && (
+                <div style={{ marginTop: 8 }}>
+                  <p style={{ opacity: 0.8 }}>观察（不构成问题，也不要求处理）</p>
+                  <ul style={{ paddingLeft: 18, marginTop: 4, opacity: 0.8 }}>
+                    {review.observations.map((item) => (
+                      <li key={item} style={{ marginBottom: 4 }}>
+                        {item}
+                      </li>
+                    ))}
+                  </ul>
                 </div>
               )}
 
@@ -1489,7 +1865,7 @@ export function WritingPage({
               </section>
             </section>
             <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
-              {canAcceptGeneratedDraft(review.issues) ? (
+              {!review.checkLoadError && canAdoptCheckedDraft(review.chapter, review.issues) ? (
                 <Button
                   icon={<Check size={16} />}
                   disabled={review.checking || busy}
@@ -1505,10 +1881,10 @@ export function WritingPage({
                     setReview(null);
                     setReviewSelectionText("");
                     setReviewContext(null);
-                    onNavigate?.("质检中心");
+                    if (!canAcceptGeneratedDraft(review.issues)) onNavigate?.("质检中心");
                   }}
                 >
-                  去质检中心处理问题
+                  {canAcceptGeneratedDraft(review.issues) ? "返回本章运行质检" : "去质检中心处理问题"}
                 </Button>
               )}
               <Button variant="secondary" disabled={busy} onClick={() => void rejectGeneratedDraft()}>
@@ -1533,29 +1909,38 @@ export function WritingPage({
                     placeholder="例如：第五章和解太快，把冲突延长到第七章；保留结尾的拥抱，但改成利益合作。"
                   />
                 </Field>
-                <div className="form-grid two">
-                  {/* biome-ignore lint/a11y/useSemanticElements: role=group+aria-label 已提供分组语义，fieldset 需调整样式 */}
-                  <div className="field" role="group" aria-label="修改依据">
-                    <span className="field-label">修改依据</span>
-                    <Segmented
-                      options={["设定为准", "当前正文为准"] as const}
-                      value={revisionInput.authority}
-                      disabled={revisionBusy}
-                      onChange={(authority) => setRevisionInput({ ...revisionInput, authority })}
-                    />
-                    <span className="field-hint">选择发生冲突时以哪一侧为准</span>
+                {revisionStyleSource ? (
+                  <div className="revision-proposal-summary">
+                    <div>
+                      <Badge tone="accent">设定为准</Badge>
+                      <Badge>仅选区</Badge>
+                    </div>
                   </div>
-                  {/* biome-ignore lint/a11y/useSemanticElements: role=group+aria-label 已提供分组语义，fieldset 需调整样式 */}
-                  <div className="field" role="group" aria-label="检查范围">
-                    <span className="field-label">检查范围</span>
-                    <Segmented
-                      options={["仅选区", "当前章节", "全书联动"] as const}
-                      value={revisionInput.scope}
-                      disabled={revisionBusy}
-                      onChange={(scope) => setRevisionInput({ ...revisionInput, scope })}
-                    />
+                ) : (
+                  <div className="form-grid two">
+                    {/* biome-ignore lint/a11y/useSemanticElements: role=group+aria-label 已提供分组语义，fieldset 需调整样式 */}
+                    <div className="field" role="group" aria-label="修改依据">
+                      <span className="field-label">修改依据</span>
+                      <Segmented
+                        options={["设定为准", "当前正文为准"] as const}
+                        value={revisionInput.authority}
+                        disabled={revisionBusy}
+                        onChange={(authority) => setRevisionInput({ ...revisionInput, authority })}
+                      />
+                      <span className="field-hint">选择发生冲突时以哪一侧为准</span>
+                    </div>
+                    {/* biome-ignore lint/a11y/useSemanticElements: role=group+aria-label 已提供分组语义，fieldset 需调整样式 */}
+                    <div className="field" role="group" aria-label="检查范围">
+                      <span className="field-label">检查范围</span>
+                      <Segmented
+                        options={["仅选区", "当前章节", "全书联动"] as const}
+                        value={revisionInput.scope}
+                        disabled={revisionBusy}
+                        onChange={(scope) => setRevisionInput({ ...revisionInput, scope })}
+                      />
+                    </div>
                   </div>
-                </div>
+                )}
                 {revisionInput.scope === "仅选区" && (
                   <div className="revision-selection-preview">
                     <strong>
@@ -1604,6 +1989,7 @@ export function WritingPage({
                         <input
                           type="checkbox"
                           checked={selectedRepairIds.includes(item.id)}
+                          disabled={revisionBusy}
                           onChange={(event) =>
                             setSelectedRepairIds((current) =>
                               event.target.checked ? [...current, item.id] : current.filter((id) => id !== item.id),
@@ -1620,7 +2006,7 @@ export function WritingPage({
                           {item.risk}风险
                         </Badge>
                       </label>
-                      <details>
+                      <details open={revisionStyleSource ? true : undefined}>
                         <summary>查看修改前后</summary>
                         <div className="revision-before-after">
                           <section>
@@ -1628,7 +2014,7 @@ export function WritingPage({
                             <pre>{item.before || "无"}</pre>
                           </section>
                           <section>
-                            <span>修改后</span>
+                            <span>{revisionStyleSource ? "拟稿" : "修改后"}</span>
                             <pre>{item.after || "无"}</pre>
                           </section>
                         </div>
@@ -1660,14 +2046,36 @@ export function WritingPage({
                   onClick={async () => {
                     setRevisionBusy(true);
                     try {
+                      assertStyleRevisionCurrent();
                       const saved = await saveLatestForAction();
-                      const proposal = await api.analyzeNovelRevision(project.summary.id, {
+                      if (revisionStyleSource) {
+                        if (saved.content !== revisionStyleSource.content)
+                          throw new Error("保存后的正文已变化，请重新检查要修改的段落");
+                        setRevisionStyleSource(saved);
+                      }
+                      const candidate = await api.analyzeNovelRevision(project.summary.id, {
                         chapterId: saved.id,
                         ...revisionInput,
                         selectionStart: revisionInput.scope === "仅选区" ? revisionSelection.start : undefined,
                         selectionEnd: revisionInput.scope === "仅选区" ? revisionSelection.end : undefined,
                         selectedText: revisionInput.scope === "仅选区" ? revisionSelection.text : undefined,
                       });
+                      const text = candidate.textRepair;
+                      if (
+                        revisionStyleSource &&
+                        (!sameManuscript(saved, draftRef.current) ||
+                          candidate.sourceChapterId !== saved.id ||
+                          (text &&
+                            (text.targetId !== saved.id ||
+                              text.baseRevision !== saved.revision ||
+                              text.start !== revisionSelection.start ||
+                              text.end !== revisionSelection.end ||
+                              text.before !== revisionSelection.text)))
+                      )
+                        throw new Error("修订建议与当前正文选区不一致，请重新检查并分析");
+                      const proposal = revisionStyleSource
+                        ? { ...candidate, contractRepairs: [], planRepairs: [], chapterRepairs: [] }
+                        : candidate;
                       setRevisionProposal(proposal);
                       setSelectedRepairIds([
                         ...proposal.contractRepairs.map((item) => item.id),
@@ -1690,19 +2098,28 @@ export function WritingPage({
                   icon={revisionBusy ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}
                   onClick={async () => {
                     setRevisionBusy(true);
+                    let applied = false;
                     try {
+                      assertStyleRevisionCurrent();
+                      const before = draftRef.current;
                       const result = await api.applyNovelRevision(
                         project.summary.id,
                         revisionProposal,
                         selectedRepairIds,
                       );
-                      await reload();
+                      applied = true;
                       const loaded = await api.getChapter(project.summary.id, revisionProposal.sourceChapterId);
-                      draftRef.current = loaded;
-                      setDraft(loaded);
-                      lastSavedSignature.current = chapterDraftSignature(loaded);
-                      setSaveStatus("saved");
-                      setRevisionOpen(false);
+                      if (
+                        loaded.id === before.id &&
+                        sameManuscript(before, draftRef.current) &&
+                        chapterDraftSignature(before) === chapterDraftSignature(draftRef.current)
+                      ) {
+                        draftRef.current = loaded;
+                        setDraft(loaded);
+                        lastSavedSignature.current = chapterDraftSignature(loaded);
+                        setSaveStatus("saved");
+                      }
+                      await reload();
                       const contractNote = result.appliedTargets.includes("创作设定") ? "；创作设定需要重新审批" : "";
                       notify(
                         `已应用 ${result.appliedTargets.length} 个目标${result.changeRequestIds.length ? `，建立 ${result.changeRequestIds.length} 条受保护变更记录` : ""}${contractNote}`,
@@ -1710,6 +2127,7 @@ export function WritingPage({
                     } catch (error) {
                       notify(describeError(error), "error");
                     } finally {
+                      if (applied) setRevisionOpen(false);
                       setRevisionBusy(false);
                     }
                   }}
@@ -1818,10 +2236,13 @@ export function WritingPage({
               <div>
                 <span>估算费用</span>
                 <strong>
-                  {batchPreview.estimatedCost ? `¥${batchPreview.estimatedCost.toFixed(2)}` : "未填写模型单价"}
+                  {batchPreview.costEstimateComplete && batchPreview.estimatedCost !== null
+                    ? `¥${batchPreview.estimatedCost.toFixed(2)}`
+                    : "无法完整估算"}
                 </strong>
               </div>
             </div>
+            <p className="muted-line">包含 {batchPreview.reviewCalls} 次章后检查；输入输出总量已计入检查估算。</p>
             <p className="inline-warning">{TOKEN_ESTIMATE_WARNING}</p>
             {batchPreview.blockingReason && <p className="inline-warning">{batchPreview.blockingReason}</p>}
             <div className="chapter-preview">
@@ -1841,52 +2262,76 @@ export function WritingPage({
                 disabled={!batchPreview.canRun || editorBusy}
                 onClick={async () => {
                   setBusy(true);
+                  let savedChapters: Chapter[] = [];
+                  let savedChecksLoaded = false;
                   try {
                     const result = await api.generateChapterBatch(project.summary.id, draft.id, taskOverride);
+                    savedChapters = result.chapters;
                     const prior = new Map<string, string>();
                     for (const chapter of project.chapters)
-                      if (chapter.number >= draft.number && chapter.number < draft.number + result.length)
+                      if (result.chapters.some((item) => item.id === chapter.id))
                         prior.set(chapter.id, chapter.content);
                     setBatchPreview(null);
-                    await reload();
+                    setBatchPauseReason(
+                      result.status === "paused"
+                        ? (result.reason ??
+                            `已保留${result.chapters.length}章草稿；第${result.stoppedAtChapter}章需要处理，后续尚未生成。`)
+                        : null,
+                    );
+                    const selectedResult = result.chapters.find((chapter) => chapter.id === draftRef.current.id);
+                    if (selectedResult) {
+                      setQualityFailure(null);
+                      draftRef.current = selectedResult;
+                      setDraft(selectedResult);
+                      lastSavedSignature.current = chapterDraftSignature(selectedResult);
+                      setSaveStatus("saved");
+                    }
                     setBatchReview(
-                      result.map((chapter) => ({
+                      result.chapters.map((chapter) => ({
                         chapter,
                         previousContent: prior.get(chapter.id) ?? "",
                         issues: [],
-                        observations: [],
+                        observations: chapter.qualityCheck?.observations ?? [],
                         checking: true,
                         adopted: false,
                       })),
                     );
-                    void Promise.all(
-                      result.map(async (chapter) => {
-                        try {
-                          const review = await api.runQualityCheck(project.summary.id, chapter.id, taskOverride);
-                          return { id: chapter.id, issues: review.issues, observations: review.observations };
-                        } catch {
-                          return { id: chapter.id, issues: [] as QualityIssue[], observations: [] as string[] };
-                        }
-                      }),
-                    ).then((checks) =>
-                      setBatchReview((current) =>
-                        current
-                          ? current.map((item) => {
-                              const check = checks.find((entry) => entry.id === item.chapter.id);
-                              return check
-                                ? {
-                                    ...item,
-                                    issues: check.issues,
-                                    observations: check.observations,
-                                    checking: false,
-                                  }
-                                : item;
-                            })
-                          : current,
-                      ),
+                    const checkedProject = await api.getProject(project.summary.id);
+                    savedChecksLoaded = true;
+                    setBatchReview(
+                      (current) =>
+                        current?.map((item) => ({
+                          ...item,
+                          checking: false,
+                          issues: checkedProject.issues.filter(
+                            (issue) => issue.chapterId === item.chapter.id && issue.status === "待处理",
+                          ),
+                        })) ?? current,
                     );
+                    if (result.status === "paused" && result.chapters.length === 0)
+                      notify(result.reason ?? "批次已暂停，请先运行质检。", "error");
+                    await reload();
                   } catch (error) {
-                    notify(describeError(error), "error");
+                    if (savedChapters.length) {
+                      const selectedResult = savedChapters.find((chapter) => chapter.id === draftRef.current.id);
+                      if (selectedResult && !savedChecksLoaded) {
+                        setQualityFailure({
+                          chapterId: selectedResult.id,
+                          reason: "检查结果未能完整载入，请重新打开本章后查看。",
+                        });
+                      }
+                      setBatchReview(
+                        (current) =>
+                          current?.map((item) => ({
+                            ...item,
+                            checking: false,
+                            ...(item.checking
+                              ? { checkLoadError: "检查结果未能完整载入，请重新打开本章后查看。" }
+                              : {}),
+                          })) ?? current,
+                      );
+                      notify(`已保留${savedChapters.length}章草稿；${describeError(error)}`, "error");
+                    } else notify(describeError(error), "error");
                   } finally {
                     setBusy(false);
                   }

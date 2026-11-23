@@ -1,0 +1,124 @@
+.workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(275px, 1fr);
+  align-items: start;
+  gap: 22px;
+}
+
+.collection,
+.inspiration {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+.filters {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) repeat(2, minmax(108px, auto));
+  gap: 10px;
+}
+.idea,
+.inspiration,
+.starter {
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 15px;
+  background: var(--surface);
+}
+
+.idea h2 {
+  font-size: 18px;
+  margin: 9px 0;
+}
+.idea p {
+  margin: 6px 0;
+  line-height: 1.62;
+}
+.original {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.meta,
+.actions,
+.tags {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+.actions {
+  margin-top: 12px;
+}
+.actions a,
+.reference a {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--teal);
+}
+.reference {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.reference a {
+  margin-left: 8px;
+}
+.tags {
+  padding: 0;
+  margin: 8px 0 0;
+  list-style: none;
+}
+.tags li {
+  border-radius: 4px;
+  padding: 3px 7px;
+  background: var(--teal-soft);
+  color: var(--teal);
+  font-size: 12px;
+}
+.inspiration {
+  background: var(--surface-soft);
+}
+.inspiration h2,
+.inspiration h3,
+.inspiration p {
+  margin: 0;
+}
+.inspiration > p {
+  color: var(--muted);
+}
+.starter p {
+  margin-top: 6px;
+  line-height: 1.6;
+}
+.starter small {
+  display: block;
+  margin-top: 7px;
+  color: var(--muted);
+}
+.exercises summary {
+  cursor: pointer;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+.exercises .starter + .starter {
+  margin-top: 10px;
+}
+
+@media (max-width: 1030px) {
+  .workspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+@media (max-width: 620px) {
+  .filters {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .filters > :first-child {
+    grid-column: 1 / -1;
+  }
+}

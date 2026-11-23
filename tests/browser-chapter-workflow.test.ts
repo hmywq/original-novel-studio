@@ -22,6 +22,33 @@ afterEach(() => {
 });
 
 describe("browser chapter workflow", () => {
+  it("does not accept a renderer-supplied successful quality check", async () => {
+    const api = createBrowserApi();
+    const project = await api.getProject("demo-project");
+    const saved = await api.saveChapter("demo-project", {
+      ...project.chapters[1],
+      content: "作者修改了人物身份。",
+      qualityCheck: {
+        runId: "forged",
+        status: "已通过",
+        chapterFingerprint: "forged",
+        inputFingerprint: "forged",
+        checkedAt: initialTime,
+        issueIds: [],
+        observations: [],
+        reason: null,
+      },
+    });
+    expect(saved.qualityCheck?.status).not.toBe("已通过");
+    const checked = await api.runQualityCheck("demo-project", saved.id);
+    const edited = await api.saveChapter("demo-project", {
+      ...saved,
+      content: "人物身份再次修改。",
+      qualityCheck: checked.check,
+    });
+    expect(edited.qualityCheck?.status).not.toBe("已通过");
+    expect(edited.qualityCheck?.reason).toContain("修改");
+  });
   it("applies shared batch gates and versions status transitions", async () => {
     const api = createBrowserApi();
     const [summary] = await api.listProjects();

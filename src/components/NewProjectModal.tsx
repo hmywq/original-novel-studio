@@ -19,8 +19,14 @@ import { FANQIE_CATEGORY_PROFILES, getFanqieCategoryProfile, listFanqieSubGenres
 import { NARRATIVE_GENRES, type NarrativeGenre, PRIMARY_GENRE_ELEMENT_GROUPS } from "../shared/genre-composition";
 import { GENRE_PLUGINS } from "../shared/genre-plugins";
 import type { IncubationPath, IncubationPositioning } from "../shared/incubation";
-import { candidateCountForPath, positioningToConceptInput } from "../shared/incubation";
+import {
+  candidateCountForPath,
+  ideaEvidenceNotes,
+  mergeIdeaSeed,
+  positioningToConceptInput,
+} from "../shared/incubation";
 import { blockingFindings, reviewIncubationCandidate, summarizeFindings } from "../shared/incubation-review";
+import { isStudioFormat, studioFormatDefaults } from "../shared/studio-format";
 import type {
   AppApi,
   IncubationCandidate,
@@ -113,6 +119,16 @@ export function NewProjectModal({
   const [busy, setBusy] = useState(false);
   const [busyMessage, setBusyMessage] = useState("正在处理…");
   const [path, setPath] = useState<IncubationPath>(initialDraft?.path ?? "探索");
+  const idea = initialDraft?.idea;
+  const studio = isStudioFormat(positioning.lengthShape);
+  const formatWordPresets =
+    positioning.lengthShape === "万字短篇"
+      ? [10_000, 11_000, 12_000, 15_000, 20_000]
+      : positioning.lengthShape === "短剧改编向"
+        ? [20_000, 30_000, 40_000, 50_000, 80_000]
+        : TARGET_WORD_PRESETS;
+  const targetWordOptions = [...new Set([...formatWordPresets, positioning.targetWords])].sort((a, b) => a - b);
+  const evidenceNotes = ideaEvidenceNotes(idea, evidenceOpportunities);
   const pathOption = PATH_OPTIONS.find((item) => item.value === path) ?? PATH_OPTIONS[0];
 
   const category = getFanqieCategoryProfile(positioning.fanqieCategoryKey);
@@ -254,18 +270,24 @@ export function NewProjectModal({
       fanqieCategoryKey: key,
       subGenreIds: [],
       openingArchetype: preset.openingArchetypes[0],
-      lengthShape: preset.lengthShape,
-      narrativePerson: preset.narrativePerson,
+      lengthShape: studio ? positioning.lengthShape : preset.lengthShape,
+      narrativePerson: studio ? positioning.narrativePerson : preset.narrativePerson,
       protagonistRoles: [...preset.protagonistRoles],
       toneTags: [...preset.toneTags],
       secondaryGenres: [...profile.narrativeGenres],
-      genreElements: [...profile.genreElements],
-      targetWords: preset.targetWords,
-      wordsPerChapter: preset.structure.chapterWords[0],
+      genreElements: studio ? positioning.genreElements : [...profile.genreElements],
+      targetWords: studio ? positioning.targetWords : preset.targetWords,
+      wordsPerChapter: studio ? positioning.wordsPerChapter : preset.structure.chapterWords[0],
       updateCadence: preset.updateCadence,
       readerPersona: profile.readerAgeBand,
       readerPromise: profile.baselineDelta?.readerPromise ?? "",
     });
+  };
+
+  const selectLength = (lengthShape: string) => {
+    patch(
+      isStudioFormat(lengthShape) ? { lengthShape, ...studioFormatDefaults(lengthShape).positioning } : { lengthShape },
+    );
   };
 
   const generate = async () => {
@@ -275,14 +297,20 @@ export function NewProjectModal({
       const next = await api.generateBookConcepts(
         positioningToConceptInput(
           positioning,
-          seed,
-          { insightIds: evidenceInsights, notes: evidenceOpportunities },
+          mergeIdeaSeed(idea, seed),
+          { insightIds: evidenceInsights, notes: evidenceNotes },
           candidateCountForPath(path),
         ),
       );
       setConcepts(next);
       setSelectedId(next[0]?.id ?? null);
       setAcknowledged([]);
+      if (idea && next.length) {
+        const saved = await api.saveIncubation(
+          buildDraft({ candidates: next, selectedCandidateId: next[0].id, review: { acknowledged: [] } }),
+        );
+        setDraftId(saved.id);
+      }
     } catch (error) {
       notify(describeError(error), "error");
     } finally {
@@ -303,8 +331,8 @@ export function NewProjectModal({
           project = await api.createProjectFromConcept(
             positioningToConceptInput(
               positioning,
-              seed,
-              { insightIds: evidenceInsights, notes: evidenceOpportunities },
+              mergeIdeaSeed(idea, seed),
+              { insightIds: evidenceInsights, notes: evidenceNotes },
               candidateCountForPath(path),
             ),
             selected,
@@ -336,6 +364,7 @@ export function NewProjectModal({
     status: "孵化中",
     step: "体检",
     path,
+    idea,
     positioning,
     evidence: {
       insightIds: evidenceInsights,
@@ -381,7 +410,7 @@ export function NewProjectModal({
           }}
         />
         <div className="form-grid two creation-essentials">
-          <Field label="番茄目标分类">
+          <Field label={studio ? "题材参考" : "番茄目标分类"}>
             <Select
               value={positioning.fanqieCategoryKey}
               onChange={(event) => selectCategory(event.target.value)}
@@ -401,16 +430,31 @@ export function NewProjectModal({
           {mode === "AI 从零开书" && (
             <Field label="方向数量">
               <Segmented
-                options={PATH_OPTIONS.map((item) => item.label)}
-                value={pathOption.label}
-                onChange={(label) => setPath(PATH_OPTIONS.find((item) => item.label === label)?.value ?? "探索")}
+                options={idea ? ["发散三套", "定向两套", "只展开一套"] : PATH_OPTIONS.map((item) => item.label)}
+                value={
+                  idea ? ["发散三套", "定向两套", "只展开一套"][PATH_OPTIONS.indexOf(pathOption)] : pathOption.label
+                }
+                onChange={(label) => {
+                  const options = idea
+                    ? ["发散三套", "定向两套", "只展开一套"]
+                    : PATH_OPTIONS.map((item) => item.label);
+                  setPath(PATH_OPTIONS[options.indexOf(label)]?.value ?? "探索");
+                }}
                 disabled={busy}
               />
             </Field>
           )}
         </div>
+        {idea && (
+          <div className="inline-warning">
+            <strong>
+              {positioning.lengthShape} · {idea.title}
+            </strong>
+            <p>原始脑洞和保留项随每次构思传给模型。{idea.keep && `要保留：${idea.keep}`}</p>
+          </div>
+        )}
         {mode === "AI 从零开书" && (
-          <Field label={path === "直达" ? "你的想法（必填）" : "你的灵感（可不填）"}>
+          <Field label={idea ? "本轮想尝试的方向" : path === "直达" ? "你的想法（必填）" : "你的灵感（可不填）"}>
             <Textarea
               rows={3}
               value={seed}
@@ -600,7 +644,7 @@ export function NewProjectModal({
               <Field label="篇幅形态">
                 <Select
                   value={positioning.lengthShape}
-                  onChange={(event) => patch({ lengthShape: event.target.value })}
+                  onChange={(event) => selectLength(event.target.value)}
                   disabled={busy}
                 >
                   {rankByRecommended(LENGTH_SHAPES, (item) => recommended.lengthShapes.has(item.name)).map((item) => (
@@ -770,10 +814,17 @@ export function NewProjectModal({
               <Field label="目标字数">
                 <Select
                   value={positioning.targetWords}
-                  onChange={(event) => patch({ targetWords: Number(event.target.value) })}
+                  onChange={(event) => {
+                    const targetWords = Number(event.target.value);
+                    patch(
+                      positioning.lengthShape === "万字短篇"
+                        ? { targetWords, wordsPerChapter: Math.ceil(targetWords / 5) }
+                        : { targetWords },
+                    );
+                  }}
                   disabled={busy}
                 >
-                  {TARGET_WORD_PRESETS.map((words) => (
+                  {targetWordOptions.map((words) => (
                     <option key={words} value={words}>
                       {words / 10000} 万字
                     </option>
@@ -788,7 +839,7 @@ export function NewProjectModal({
                   step={100}
                   value={positioning.wordsPerChapter}
                   onChange={(event) => patch({ wordsPerChapter: Number(event.target.value) })}
-                  disabled={busy}
+                  disabled={busy || positioning.lengthShape === "万字短篇"}
                 />
               </Field>
               <Field label="安全存稿线">
@@ -873,7 +924,7 @@ export function NewProjectModal({
                       <dd>{concept.titleOptions.map((item) => item.title).join(" / ")}</dd>
                       <dt>首章钩子</dt>
                       <dd>{concept.openingDesign.chapter1Hook}</dd>
-                      <dt>前三章承诺</dt>
+                      <dt>{positioning.lengthShape === "短剧改编向" ? "前三集改编预演" : "开篇承诺"}</dt>
                       <dd>{concept.openingDesign.firstThreeChaptersPromise}</dd>
                       <dt>首个回报</dt>
                       <dd>第 {concept.openingDesign.firstPayoffChapter} 章</dd>
@@ -885,8 +936,22 @@ export function NewProjectModal({
                       <dd>{concept.differentiation.against.join("；")}</dd>
                       <dt>建议标签</dt>
                       <dd>{concept.suggestedTags.join("、")}</dd>
-                      <dt>长篇发动机</dt>
+                      <dt>{studio ? "后续冲突怎么发生" : "长篇发动机"}</dt>
                       <dd>{concept.longFormEngine}</dd>
+                      {studio && (
+                        <>
+                          <dt>主角要什么</dt>
+                          <dd>{concept.protagonistDesire}</dd>
+                          <dt>代价与阶段回报</dt>
+                          <dd>
+                            {concept.escalationLadder
+                              .map((stage) => `${stage.stage}：${stage.cost} → ${stage.payoff}`)
+                              .join("；")}
+                          </dd>
+                          <dt>终局兑现</dt>
+                          <dd>{concept.ending}</dd>
+                        </>
+                      )}
                     </dl>
                   </button>
                 ))}

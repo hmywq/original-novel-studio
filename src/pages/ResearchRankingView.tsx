@@ -1,22 +1,16 @@
 import { BarChart3, ExternalLink, Link2, TrendingUp } from "lucide-react";
 import { Badge, Button, EmptyState } from "../components/UI";
 import { formatCount, formatDate } from "../lib/format";
-import type { RankingAnalytics, RankingEntry, RankingSnapshot } from "../shared/types";
+import type { RankingAnalytics, RankingSnapshot } from "../shared/types";
 import styles from "./ResearchPage.module.css";
 
 interface ResearchRankingViewProps {
   analytics: RankingAnalytics | null;
   rankings: RankingSnapshot[];
-  onOpenPublicSample: (snapshot: RankingSnapshot, entry: RankingEntry) => void;
   onOpenPublicRanking: () => void;
 }
 
-export function ResearchRankingView({
-  analytics,
-  rankings,
-  onOpenPublicSample,
-  onOpenPublicRanking,
-}: ResearchRankingViewProps) {
+export function ResearchRankingView({ analytics, rankings, onOpenPublicRanking }: ResearchRankingViewProps) {
   return (
     <section className="section-band">
       {analytics && (
@@ -57,12 +51,12 @@ export function ResearchRankingView({
           <div className="section-heading">
             <div>
               <h2>榜单趋势与立项机会</h2>
-              <p>按同一番茄榜单的连续快照估算动能与竞争，仅作选题证据，不替代人工判断。</p>
+              <p>从连续榜单快照估算入榜变化和名次，供立项时参考。</p>
             </div>
           </div>
           <div className={styles.marketOpportunityGrid}>
             {analytics.marketOpportunities.slice(0, 6).map((opportunity) => (
-              <article key={opportunity.listName}>
+              <article key={JSON.stringify([opportunity.source, opportunity.listName])}>
                 <div className={styles.opportunityHead}>
                   <div>
                     <Badge tone="accent">{opportunity.genre}</Badge>
@@ -75,6 +69,7 @@ export function ResearchRankingView({
                   </span>
                 </div>
                 <p>{opportunity.recommendation}</p>
+                {opportunity.source && <small>{opportunity.source}</small>}
                 <small>
                   {opportunity.evidenceLevel} · 证据 {opportunity.dataSufficiency}% · 动能{" "}
                   {opportunity.momentumScore ?? "待观察"} · 竞争{opportunity.competition}
@@ -99,70 +94,71 @@ export function ResearchRankingView({
               <span>
                 <strong>{snapshot.listName}</strong>
                 <small>
-                  {snapshot.source} · {formatDate(snapshot.capturedAt, true)}
+                  {snapshot.source}
+                  {snapshot.sourceVersion && !snapshot.sourceVersion.startsWith("sha256:")
+                    ? ` · 数据期 ${snapshot.sourceVersion}`
+                    : ""}
+                  {" · 入库 "}
+                  {formatDate(snapshot.capturedAt, true)}
                 </small>
               </span>
-              <Badge tone={snapshot.status === "成功" ? "success" : "warning"}>{snapshot.status}</Badge>
+              <Badge tone={snapshot.status === "成功" ? "success" : snapshot.status === "失败" ? "danger" : "warning"}>
+                {snapshot.status}
+              </Badge>
             </div>
-            <div className="data-table">
-              <div className={`data-head ${styles.rankingGrid}`}>
-                <span>排名</span>
-                <span>书名</span>
-                <span>题材</span>
-                <span>字数</span>
-                <span>状态</span>
-                <span>官方页</span>
-              </div>
-              {snapshot.entries.slice(0, 20).map((entry) => (
-                <div className={`data-row ${styles.rankingGrid}`} key={entry.id}>
-                  <span className={styles.rankNumber}>{entry.rank}</span>
-                  <span>
-                    <strong>{entry.title}</strong>
-                    <small>{entry.author}</small>
-                  </span>
-                  <span>{entry.genre}</span>
-                  <span>{formatCount(entry.words)}</span>
-                  <span>{entry.status}</span>
-                  <span className={styles.rankingLinks}>
-                    {entry.sourceUrl && (
-                      <a
-                        href={entry.sourceUrl}
-                        target="_blank"
-                        rel="noreferrer"
-                        title={entry.synopsis || "打开番茄官方详情页"}
-                      >
-                        详情 <ExternalLink size={12} />
-                      </a>
-                    )}
-                    {entry.officialReaderUrl && (
-                      <a href={entry.officialReaderUrl} target="_blank" rel="noreferrer">
-                        阅读
-                      </a>
-                    )}
-                    {entry.sourceUrl && entry.platform === "番茄小说" && (
-                      <button
-                        className={styles.linkButton}
-                        type="button"
-                        onClick={() => onOpenPublicSample(snapshot, entry)}
-                        title="读取官方公开前10章并拆书"
-                      >
-                        拆前10章
-                      </button>
-                    )}
-                  </span>
+            {snapshot.error && <p className="inline-warning">{snapshot.error}</p>}
+            {snapshot.entries.length > 0 && (
+              <div className="data-table">
+                <div className={`data-head ${styles.rankingGrid}`}>
+                  <span>排名</span>
+                  <span>作品</span>
+                  <span>题材</span>
+                  <span>字数</span>
+                  <span>状态</span>
+                  <span>来源链接</span>
                 </div>
-              ))}
-            </div>
+                {snapshot.entries.slice(0, 20).map((entry) => (
+                  <div className={`data-row ${styles.rankingGrid}`} key={entry.id}>
+                    <span className={styles.rankNumber}>{entry.rank}</span>
+                    <span>
+                      <strong>{entry.title}</strong>
+                      <small>{entry.author}</small>
+                      {entry.readerCount != null && <small>在读 {formatCount(entry.readerCount)}</small>}
+                    </span>
+                    <span>{entry.genre}</span>
+                    <span>{entry.words > 0 ? formatCount(entry.words) : "—"}</span>
+                    <span>{entry.status}</span>
+                    <span className={styles.rankingLinks}>
+                      {entry.sourceUrl && (
+                        <a
+                          href={entry.sourceUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          title={entry.synopsis || "打开来源详情页"}
+                        >
+                          详情 <ExternalLink size={12} />
+                        </a>
+                      )}
+                      {entry.officialReaderUrl && (
+                        <a href={entry.officialReaderUrl} target="_blank" rel="noreferrer">
+                          阅读
+                        </a>
+                      )}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         ))
       ) : (
         <EmptyState
           icon={<BarChart3 />}
           title="还没有榜单快照"
-          description="采集番茄官方公开榜单或导入 CSV，系统会按日期保留不可变快照。"
+          description="同步榜单源或导入 CSV，即可保存榜单快照并追踪标签变化。"
           action={
             <Button onClick={onOpenPublicRanking} icon={<Link2 size={17} />}>
-              采集番茄榜单
+              同步榜单源
             </Button>
           }
         />

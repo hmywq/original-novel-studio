@@ -62,7 +62,7 @@ describe("browser quality workflow", () => {
     );
   });
 
-  it("versions a draft when quality checking advances its status", async () => {
+  it("records an incomplete local-only check without creating a content revision", async () => {
     const api = createBrowserApi();
     const project = await api.getProject("demo-project");
     const outline = project.chapters[1];
@@ -73,16 +73,43 @@ describe("browser quality workflow", () => {
     const checkedAt = "2026-08-01T02:00:00.000Z";
     vi.setSystemTime(checkedAt);
 
-    await api.runQualityCheck("demo-project", draft.id);
+    const result = await api.runQualityCheck("demo-project", draft.id);
     const reloaded = await api.getProject("demo-project");
     const checked = reloaded.chapters.find((item) => item.id === draft.id);
 
     expect(checked).toMatchObject({
       status: "待质检",
-      revision: draft.revision + 1,
+      revision: draft.revision,
       updatedAt: checkedAt,
     });
+    expect(result.check).toMatchObject({ status: "未完成检查", checkedAt });
+    expect(result.check.reason).toContain("浏览器预览");
+    expect(checked?.qualityCheck).toEqual(result.check);
     expect(reloaded.summary.updatedAt).toBe(checkedAt);
     await expect(api.runQualityCheck("demo-project", "missing")).rejects.toThrow("章节不存在");
+  });
+
+  it("a local-only check preserves existing unresolved hard conflicts", async () => {
+    const api = createBrowserApi();
+    await api.getProject("demo-project");
+    await api.runQualityCheck("demo-project", "demo-chapter-1");
+    const snapshot = JSON.parse(storedState!);
+    snapshot.projects[0].issues.push({
+      id: "prior-hard",
+      projectId: "demo-project",
+      chapterId: "demo-chapter-1",
+      severity: "硬性",
+      category: "事实冲突",
+      message: "已完成的退款被重复执行",
+      evidence: "款项已退回",
+      status: "待处理",
+      createdAt: "2026-07-30T00:00:00.000Z",
+    });
+    storedState = JSON.stringify(snapshot);
+    const reloaded = createBrowserApi();
+    const result = await reloaded.runQualityCheck("demo-project", "demo-chapter-1");
+    const project = await reloaded.getProject("demo-project");
+    expect(result.check.status).toBe("未完成检查");
+    expect(project.issues.find((issue) => issue.id === "prior-hard")?.status).toBe("待处理");
   });
 });

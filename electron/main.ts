@@ -1,7 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import { autoUpdater } from "electron-updater";
+import type { TaskModelOverride } from "../src/shared/ai/types";
+import { QUALITY_REVIEW_ESTIMATED_OUTPUT_TOKENS } from "../src/shared/chapter-batch-service";
 import { compileProjectChapterContext } from "../src/shared/context-compiler";
 import {
   applyContractRepairs,
@@ -10,6 +13,7 @@ import {
   planRevisionSnapshot,
   sameRevisionSnapshot,
 } from "../src/shared/novel-revision";
+import { estimateChapterOutputTokens, estimateTextTokens } from "../src/shared/token-estimator";
 import type {
   Chapter,
   ChapterFactsExtractionEvent,
@@ -24,6 +28,7 @@ import { createAiRouteResolver } from "./ai/route-resolver";
 import { AiService } from "./ai-service";
 import { createEncryptedBackup } from "./backup";
 import { type ChapterGenerationCoordinator, createChapterGenerationCoordinator } from "./chapter-generation-service";
+import { type ChapterQualityService, createChapterQualityService } from "./chapter-quality-service";
 import {
   deleteAiProfileCredential,
   deleteApiCredential,
@@ -65,6 +70,21 @@ function compileContextWithBudget(
   relevantFacts?: readonly LedgerFact[],
 ): ContextPackage {
   return compileProjectChapterContext(project, chapter, relevantFacts, ai.contextBudget());
+}
+function compileReviewContextWithBudget(
+  project: ProjectDetail,
+  chapter: Chapter,
+  relevantFacts?: readonly LedgerFact[],
+  override?: TaskModelOverride,
+): ContextPackage {
+  const budget = ai.contextBudget("review", override);
+  const bodyTokens = chapter.content.trim()
+    ? estimateTextTokens(chapter.content.slice(0, 16_000))
+    : estimateChapterOutputTokens(chapter.targetWords ?? project.summary.wordsPerChapter ?? 2_300);
+  return compileProjectChapterContext(project, chapter, relevantFacts, {
+    ...budget,
+    budgetTokens: Math.max(1, budget.budgetTokens - bodyTokens),
+  });
 }
 /** 来源熔断与并发控制：进程内共享，任务成功/失败都会更新。 */
 const profileRuntime = createProfileRuntime();
@@ -112,6 +132,7 @@ async function prewarmProfileCredentials() {
   }
 }
 let chapterGeneration: ChapterGenerationCoordinator;
+let chapterQuality: ChapterQualityService;
 let rankingScheduleTimer: ReturnType<typeof setInterval> | null = null;
 let researchHandlers: ResearchHandlerRuntime;
 let autoBackupTimer: ReturnType<typeof setInterval> | null = null;
@@ -119,6 +140,15 @@ let systemHandlers: SystemHandlerRuntime;
 let logger: StructuredLogger;
 let updateService: UpdateService | null = null;
 let quitInstallAttempted = false;
+
+const appName = "原创小说工作台";
+app.setName(appName);
+if (process.platform === "win32") app.setAppUserModelId("cn.local.original.novelstudio");
+const profileRoot = path.resolve(process.env.NOVEL_STUDIO_USER_DATA || path.join(app.getPath("appData"), appName));
+mkdirSync(profileRoot, { recursive: true });
+app.setPath("userData", profileRoot);
+app.setPath("sessionData", profileRoot);
+
 const singleInstanceLockDisabled = process.env.NOVEL_STUDIO_DISABLE_SINGLE_INSTANCE_LOCK === "1";
 const hasSingleInstanceLock = singleInstanceLockDisabled || app.requestSingleInstanceLock();
 
@@ -267,6 +297,7 @@ function registerHandlers() {
   researchHandlers = registerResearchHandlers({
     register: handle,
     database,
+    workspaceRoot: database.root,
     ai,
     worker,
     chooseResearchFile: async () => {
@@ -362,9 +393,7 @@ function registerHandlers() {
     },
     previewChapterBatch: chapterGeneration.previewBatch,
     generateChapterBatch: chapterGeneration.generateBatch,
-    runLocalQualityCheck: (input) => worker.run("quality-check", input),
-    createId: randomUUID,
-    currentTimestamp: now,
+    quality: chapterQuality,
     isGenerationActive: chapterGeneration.isActive,
     markGenerationActive: chapterGeneration.markActive,
     markGenerationIdle: chapterGeneration.markIdle,
@@ -528,7 +557,7 @@ function createWindow() {
     minWidth: 1080,
     minHeight: 720,
     backgroundColor: "#f4f4f1",
-    title: "长篇创作工作台",
+    title: appName,
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
@@ -575,8 +604,7 @@ function createWindow() {
 
 if (hasSingleInstanceLock)
   app.whenReady().then(async () => {
-    const workspaceRoot =
-      process.env.NOVEL_STUDIO_WORKSPACE || path.join(app.getPath("documents"), "长篇创作工作台数据");
+    const workspaceRoot = process.env.NOVEL_STUDIO_WORKSPACE || path.join(app.getPath("documents"), `${appName}数据`);
     try {
       apiCredential = await readApiCredential();
     } catch {
@@ -623,16 +651,36 @@ if (hasSingleInstanceLock)
       profileRuntime,
       hasUsableAiCredential,
     );
+    chapterQuality = createChapterQualityService({
+      database,
+      ai,
+      compileContext: compileReviewContextWithBudget,
+      runLocalQualityCheck: (input) => worker.run("quality-check", input),
+      hasAiCredential: hasUsableAiCredential,
+      createId: randomUUID,
+      currentTimestamp: now,
+    });
     chapterGeneration = createChapterGenerationCoordinator({
       database,
       ai,
       hasAiCredential: hasUsableAiCredential,
       compileContext: compileContextWithBudget,
+      quality: chapterQuality,
+      draftPricing: (override) => ai.modelPricing("draft", override),
+      estimateReview: (project, chapter, override) => ({
+        inputTokens:
+          compileReviewContextWithBudget(project, chapter, undefined, override).estimatedTokens +
+          (chapter.content.trim()
+            ? estimateTextTokens(chapter.content.slice(0, 16_000))
+            : estimateChapterOutputTokens(chapter.targetWords ?? project.summary.wordsPerChapter ?? 2_300)),
+        outputTokens: QUALITY_REVIEW_ESTIMATED_OUTPUT_TOKENS,
+        pricing: ai.modelPricing("review", override),
+      }),
     });
     updateService = createUpdateService({
       logger,
       updater: autoUpdater,
-      enabled: app.isPackaged && process.env.NOVEL_STUDIO_DISABLE_AUTO_UPDATE !== "1",
+      enabled: false,
       currentVersion: app.getVersion(),
       getSettings: () => database.getUpdateSettings(),
       saveSettings: (input) => database.saveUpdateSettings(input),

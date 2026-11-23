@@ -5,6 +5,91 @@
   gap: 8px;
 }
 
+.watchPanel {
+  padding: 18px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  border-radius: 12px;
+}
+
+.watchForm {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) auto minmax(190px, 1fr);
+  align-items: end;
+  gap: 12px;
+  margin: 15px 0;
+}
+
+.watchEvidence,
+.watchSubhead {
+  margin: 14px 0;
+  color: var(--muted);
+}
+
+.watchGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(250px, 100%), 1fr));
+  gap: 12px;
+}
+
+.watchCard {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-soft);
+  padding: 12px;
+  min-width: 0;
+}
+
+.watchCardHead,
+.watchActions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.watchActions {
+  justify-content: flex-start;
+  margin-top: auto;
+}
+
+.watchCard ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-wrap: anywhere;
+}
+
+.watchCard a {
+  color: var(--teal);
+}
+
+.watchBar {
+  height: 5px;
+  background: var(--line);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.watchBar span {
+  display: block;
+  height: 100%;
+  background: var(--teal);
+}
+
+@media (max-width: 720px) {
+  .watchForm {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .watchForm > :last-child {
+    grid-column: 1 / -1;
+  }
+}
+
 .snapshot + .snapshot {
   margin-top: 18px;
   border-top: 1px solid var(--line);
@@ -98,43 +183,12 @@
   text-decoration: underline;
 }
 
-.rankingLinks .linkButton {
-  padding: 0;
-  color: var(--accent);
-  background: transparent;
-  border: 0;
-  font: inherit;
-  cursor: pointer;
-}
-
-.rankingLinks .linkButton:hover {
-  text-decoration: underline;
-}
-
-.sourcePreview {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 12px;
+.inboxPath {
+  color: var(--muted);
+  padding: 7px 9px;
+  border-radius: 5px;
   background: var(--surface-soft);
-  border: 1px solid var(--line);
-  border-radius: 7px;
-}
-
-.sourcePreview span {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-  gap: 3px;
-}
-
-.sourcePreview strong,
-.sourcePreview small {
   overflow-wrap: anywhere;
-}
-
-.fanqieRankingFilters {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .marketOpportunityPanel {
@@ -204,23 +258,9 @@
 
 .scheduleCreateRow {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 100px auto;
+  grid-template-columns: minmax(100px, 180px) max-content;
   align-items: end;
   gap: 10px;
-}
-
-.scheduleCreateRow > span {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-}
-
-.scheduleCreateRow small {
-  overflow: hidden;
-  color: var(--subtle);
-  font-size: 10px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .rankingScheduleList article {
@@ -392,6 +432,13 @@
   margin-top: auto;
   color: var(--subtle);
   font-size: 9px;
+}
+
+.insightActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
 }
 
 .importPreview {
@@ -668,7 +715,6 @@
   }
 
   .scheduleCreateRow,
-  .fanqieRankingFilters,
   .genreKnowledgeGrid,
   .marketOpportunityGrid {
     grid-template-columns: 1fr;

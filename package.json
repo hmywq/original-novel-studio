@@ -1,11 +1,11 @@
 {
-  "name": "fanqie-novel-studio",
+  "name": "original-novel-studio",
   "version": "0.7.0",
   "private": true,
-  "description": "本地优先的番茄小说长篇创作工作台",
+  "description": "本地优先的中文小说创作工作台，支持长篇、万字短篇和短剧改编向小说",
   "author": {
-    "name": "juice4927",
-    "url": "https://github.com/juice4927"
+    "name": "hmywq",
+    "url": "https://github.com/hmywq"
   },
   "main": "dist-electron/main.cjs",
   "type": "module",
@@ -21,7 +21,6 @@
     "test:e2e": "playwright test",
     "test:electron": "playwright test --config playwright.electron.config.ts",
     "dist:win": "npm run build && electron-builder --win nsis --publish never",
-    "release:win": "npm run build && electron-builder --win nsis",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "format": "biome format --write .",
@@ -66,8 +65,8 @@
     "wait-on": "^8.0.4"
   },
   "build": {
-    "appId": "cn.local.fanqie.novelstudio",
-    "productName": "长篇创作工作台",
+    "appId": "cn.local.original.novelstudio",
+    "productName": "原创小说工作台",
     "directories": {
       "output": "release"
     },
@@ -75,6 +74,11 @@
       "dist/**/*",
       "dist-electron/**/*",
       "package.json"
+    ],
+    "extraResources": [
+      "LICENSE",
+      "THIRD_PARTY_NOTICES.md",
+      "licenses/OH-STORY-MIT.txt"
     ],
     "asar": true,
     "win": {
@@ -87,21 +91,17 @@
       "createDesktopShortcut": true,
       "deleteAppDataOnUninstall": false
     },
-    "publish": {
-      "provider": "github",
-      "owner": "juice4927",
-      "repo": "fanqie-novel-studio"
-    }
+    "publish": null
   },
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/juice4927/fanqie-novel-studio.git"
+    "url": "git+https://github.com/hmywq/original-novel-studio.git"
   },
   "bugs": {
-    "url": "https://github.com/juice4927/fanqie-novel-studio/issues"
+    "url": "https://github.com/hmywq/original-novel-studio/issues"
   },
-  "homepage": "https://github.com/juice4927/fanqie-novel-studio#readme",
+  "homepage": "https://github.com/hmywq/original-novel-studio#readme",
   "keywords": [
     "fanqie",
     "novel-writing",

@@ -252,21 +252,62 @@ describe("chapter batch service", () => {
       { inputPricePerMillion: 2, outputPricePerMillion: 4 },
       "chapter-1",
       estimateInputTokens,
+      {
+        estimateReview: () => ({
+          inputTokens: 300,
+          outputTokens: 2_000,
+          pricing: { inputPerMillion: 3, outputPerMillion: 6 },
+        }),
+      },
     );
 
     expect(preview).toMatchObject({
       canRun: true,
       blockingReason: null,
-      inputTokens: 500,
-      outputTokens: 10_400,
+      inputTokens: 2_000,
+      outputTokens: 20_400,
+      reviewCalls: 5,
+      reviewInputTokens: 1_500,
+      reviewOutputTokens: 10_000,
+      costEstimateComplete: true,
       chapters: project.chapters.map(({ id, number, title }) => ({
         id,
         number,
         title,
       })),
     });
-    expect(preview.estimatedCost).toBeCloseTo(0.0426);
+    expect(preview.estimatedCost).toBeCloseTo(0.1071);
     expect(estimateInputTokens).toHaveBeenCalledTimes(5);
+  });
+
+  it("does not substitute draft prices when the review route price is unknown", () => {
+    const preview = buildChapterBatchPreview(
+      createProject(),
+      { inputPricePerMillion: 2, outputPricePerMillion: 4 },
+      "chapter-1",
+      () => 100,
+      { estimateReview: () => ({ inputTokens: 300, outputTokens: 2_000, pricing: null }) },
+    );
+    expect(preview.reviewCalls).toBe(5);
+    expect(preview.costEstimateComplete).toBe(false);
+    expect(preview.estimatedCost).toBeNull();
+  });
+
+  it("does not charge for already written chapters with a reusable complete check", () => {
+    const project = createProject();
+    project.chapters[0].content = "已检查正文";
+    const estimateReview = vi.fn(() => ({ inputTokens: 300, outputTokens: 2_000, pricing: null }));
+    const estimateDraft = vi.fn(() => 100);
+    const preview = buildChapterBatchPreview(
+      project,
+      { inputPricePerMillion: 2, outputPricePerMillion: 4 },
+      "chapter-1",
+      estimateDraft,
+      { estimateReview, canReuseQuality: () => true },
+    );
+    expect(preview.reviewCalls).toBe(4);
+    expect(estimateReview).toHaveBeenCalledTimes(4);
+    expect(estimateDraft).toHaveBeenCalledTimes(4);
   });
 
   it("allows contract exclusions to override major state keywords", () => {
